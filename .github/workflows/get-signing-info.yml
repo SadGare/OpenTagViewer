@@ -42,11 +42,11 @@ jobs:
           echo "======================================"
           ./gradlew signingReport --no-daemon
       
-      - name: 提取关键信息
+      - name: 提取签名信息
         run: |
           echo ""
           echo "======================================"
-          echo "📋 配置 Google Maps API Key 所需信息"
+          echo "Android 应用签名信息"
           echo "======================================"
           echo ""
           
@@ -56,162 +56,59 @@ jobs:
           echo "   $PACKAGE_NAME"
           echo ""
           
-          # 使用 keytool 直接读取 Debug SHA1（更可靠）
-          echo "🔐 Debug SHA1 指纹 (用于开发测试):"
+          # 提取 Debug SHA1
+          echo "🔐 Debug SHA1 指纹:"
           DEBUG_SHA1=$(keytool -list -v -keystore $HOME/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android 2>/dev/null | grep "SHA1:" | sed 's/.*SHA1: //')
           echo "   $DEBUG_SHA1"
           echo ""
           
-          # 同时提取 SHA256（某些平台可能需要）
-          echo "🔐 Debug SHA256 指纹 (备用):"
+          # 提取 SHA256（备用）
+          echo "🔐 Debug SHA256 指纹:"
           DEBUG_SHA256=$(keytool -list -v -keystore $HOME/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android 2>/dev/null | grep "SHA256:" | sed 's/.*SHA256: //')
           echo "   $DEBUG_SHA256"
           echo ""
           
-          # 提取 Release SHA1 (如果有)
-          echo "🔐 Release SHA1 指纹 (用于正式发布):"
-          RELEASE_SHA1=$(./gradlew signingReport --no-daemon 2>/dev/null | grep -A 2 "Variant: release" | grep "SHA1:" | sed 's/.*SHA1: /   /')
-          if [ -z "$RELEASE_SHA1" ]; then
-            echo "   未配置 Release 签名 (使用 Debug 签名即可)"
-          else
-            echo "$RELEASE_SHA1"
-          fi
-          echo ""
-          
-          echo "======================================"
-          echo "📝 如何使用这些信息"
-          echo "======================================"
-          echo ""
-          
-          # 保存变量供后续使用
-          DEBUG_SHA1=$(keytool -list -v -keystore $HOME/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android 2>/dev/null | grep "SHA1:" | sed 's/.*SHA1: //')
-          
-          echo "【Google Maps API Key 配置】"
-          echo "1. 访问: https://console.cloud.google.com/apis/credentials"
-          echo "2. 创建凭据 → API 密钥"
-          echo "3. 限制密钥 → 选择「Android 应用」"
-          echo "4. 添加包名称和指纹:"
-          echo "   - 包名称: $PACKAGE_NAME"
-          echo "   - SHA-1 证书指纹: $DEBUG_SHA1"
-          echo "5. 保存后复制 API Key"
-          echo ""
-          echo "【高德地图 API Key 配置】"
-          echo "1. 访问: https://console.amap.com/dev/key/app"
-          echo "2. 创建新应用 → 添加 Key"
-          echo "3. 服务平台选择「Android 平台」"
-          echo "4. 填写信息:"
-          echo "   - PackageName: $PACKAGE_NAME"
-          echo "   - 发布版安全码 SHA1: $DEBUG_SHA1"
-          echo "5. 提交后复制 Key"
-          echo ""
-          echo "【配置到 GitHub Secrets】"
-          echo "访问: https://github.com/${{ github.repository }}/settings/secrets/actions"
-          echo ""
-          echo "在 Environment 'Android Build' 中添加:"
-          echo "  - MAPS_API_KEY = <你的Google Maps API Key>"
-          echo "  - AMAP_API_KEY = <你的高德地图API Key>"
-          echo ""
           echo "======================================"
           
-          # 保存 GitHub 仓库路径
-          REPO_PATH="${{ github.repository }}"
+          # 保存到文件
+          cat > signing-info.txt << 'SIGNING_INFO_END'
+====================================
+Android 应用签名信息
+====================================
+SIGNING_INFO_END
+          echo "" >> signing-info.txt
+          echo "包名 (Package Name):" >> signing-info.txt
+          echo "$PACKAGE_NAME" >> signing-info.txt
+          echo "" >> signing-info.txt
+          echo "Debug SHA1:" >> signing-info.txt
+          echo "$DEBUG_SHA1" >> signing-info.txt
+          echo "" >> signing-info.txt
+          echo "Debug SHA256:" >> signing-info.txt
+          echo "$DEBUG_SHA256" >> signing-info.txt
+          echo "" >> signing-info.txt
+          echo "====================================" >> signing-info.txt
           
-          # 将信息保存到文件
-          cat > api-key-info.txt << 'EOF_MARKER'
-======================================
-API Key 配置信息
-======================================
-
-📦 包名 (Package Name):
-EOF_MARKER
-          echo "$PACKAGE_NAME" >> api-key-info.txt
-          cat >> api-key-info.txt << 'EOF_MARKER'
-
-🔐 Debug SHA1 指纹:
-EOF_MARKER
-          echo "$DEBUG_SHA1" >> api-key-info.txt
-          cat >> api-key-info.txt << 'EOF_MARKER'
-
-🔐 Debug SHA256 指纹:
-EOF_MARKER
-          keytool -list -v -keystore $HOME/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android 2>/dev/null | grep "SHA256:" | sed 's/.*SHA256: //' >> api-key-info.txt
-          cat >> api-key-info.txt << 'EOF_MARKER'
-
-======================================
-Google Maps API Key 配置步骤
-======================================
-
-1. 访问: https://console.cloud.google.com/apis/credentials
-2. 创建凭据 → API 密钥
-3. 限制密钥 → Android 应用
-4. 添加:
-EOF_MARKER
-          echo "   包名称: $PACKAGE_NAME" >> api-key-info.txt
-          echo "   SHA-1 指纹: $DEBUG_SHA1" >> api-key-info.txt
-          cat >> api-key-info.txt << 'EOF_MARKER'
-5. 保存并复制 API Key
-
-======================================
-高德地图 API Key 配置步骤
-======================================
-
-1. 访问: https://console.amap.com/dev/key/app
-2. 创建应用 → 添加 Key → Android 平台
-3. 填写:
-EOF_MARKER
-          echo "   PackageName: $PACKAGE_NAME" >> api-key-info.txt
-          echo "   SHA1: $DEBUG_SHA1" >> api-key-info.txt
-          cat >> api-key-info.txt << 'EOF_MARKER'
-4. 提交并复制 Key
-
-======================================
-配置到 GitHub Repository Secrets
-======================================
-
-EOF_MARKER
-          echo "访问: https://github.com/$REPO_PATH/settings/environments" >> api-key-info.txt
-          cat >> api-key-info.txt << 'EOF_MARKER'
-
-创建 Environment: Android Build
-添加以下 Secrets:
-  - MAPS_API_KEY = <你的Google Maps API Key>
-  - AMAP_API_KEY = <你的高德地图API Key>
-
-======================================
-EOF_MARKER
-          
-          echo ""
-          echo "✅ 配置信息已保存到 api-key-info.txt"
+          echo "✅ 签名信息已保存到 signing-info.txt"
       
       - name: 生成完整签名报告文件
         run: |
           ./gradlew signingReport --no-daemon > signing-report.txt 2>&1
           echo "完整的签名报告已保存到 signing-report.txt"
       
-      - name: 上传配置信息文件
+      - name: 上传签名信息
         uses: actions/upload-artifact@v4
         with:
-          name: api-key-configuration-info
+          name: android-signing-info
           path: |
-            api-key-info.txt
+            signing-info.txt
             signing-report.txt
           retention-days: 7
       
-      - name: 显示完成信息
+      - name: 完成
         run: |
           echo ""
-          echo "======================================"
-          echo "✅ 完成！"
-          echo "======================================"
+          echo "✅ 签名信息已生成"
           echo ""
-          echo "📥 配置信息已上传为 Artifact"
-          echo "   在本页面顶部可下载 'api-key-configuration-info'"
-          echo ""
-          echo "📋 下一步操作:"
-          echo "1. ⬆️  向上滚动查看完整的 SHA1 指纹和包名"
-          echo "2. 📥 或下载 Artifact 中的 api-key-info.txt 文件"
-          echo "3. 🔑 按照说明到 Google/高德平台申请 API Key"
-          echo "4. 🔐 将 API Key 添加到 GitHub Secrets"
-          echo "5. 🚀 推送代码，GitHub Actions 会自动构建"
+          echo "可在页面顶部下载 Artifact: android-signing-info"
           echo ""
 
