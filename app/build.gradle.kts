@@ -138,7 +138,7 @@ dependencies {
 
     // 高德地图SDK - Android 3D地图 V9.8.3
     // 参考文档：https://lbs.amap.com/api/android-sdk/gettingstarted
-    implementation(libs.amap.3dmap)
+    implementation(libs.amap.`3dmap`)
     implementation(libs.amap.location)
 
     testImplementation(libs.junit)
