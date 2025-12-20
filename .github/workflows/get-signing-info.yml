@@ -113,20 +113,29 @@ jobs:
           echo ""
           echo "======================================"
           
+          # 保存 GitHub 仓库路径
+          REPO_PATH="${{ github.repository }}"
+          
           # 将信息保存到文件
-          cat > api-key-info.txt << EOF
+          cat > api-key-info.txt << 'EOF_MARKER'
 ======================================
 API Key 配置信息
 ======================================
 
 📦 包名 (Package Name):
-$PACKAGE_NAME
+EOF_MARKER
+          echo "$PACKAGE_NAME" >> api-key-info.txt
+          cat >> api-key-info.txt << 'EOF_MARKER'
 
 🔐 Debug SHA1 指纹:
-$DEBUG_SHA1
+EOF_MARKER
+          echo "$DEBUG_SHA1" >> api-key-info.txt
+          cat >> api-key-info.txt << 'EOF_MARKER'
 
 🔐 Debug SHA256 指纹:
-$(keytool -list -v -keystore $HOME/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android 2>/dev/null | grep "SHA256:" | sed 's/.*SHA256: //')
+EOF_MARKER
+          keytool -list -v -keystore $HOME/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android 2>/dev/null | grep "SHA256:" | sed 's/.*SHA256: //' >> api-key-info.txt
+          cat >> api-key-info.txt << 'EOF_MARKER'
 
 ======================================
 Google Maps API Key 配置步骤
@@ -136,8 +145,10 @@ Google Maps API Key 配置步骤
 2. 创建凭据 → API 密钥
 3. 限制密钥 → Android 应用
 4. 添加:
-   包名称: $PACKAGE_NAME
-   SHA-1 指纹: $DEBUG_SHA1
+EOF_MARKER
+          echo "   包名称: $PACKAGE_NAME" >> api-key-info.txt
+          echo "   SHA-1 指纹: $DEBUG_SHA1" >> api-key-info.txt
+          cat >> api-key-info.txt << 'EOF_MARKER'
 5. 保存并复制 API Key
 
 ======================================
@@ -147,15 +158,19 @@ Google Maps API Key 配置步骤
 1. 访问: https://console.amap.com/dev/key/app
 2. 创建应用 → 添加 Key → Android 平台
 3. 填写:
-   PackageName: $PACKAGE_NAME
-   SHA1: $DEBUG_SHA1
+EOF_MARKER
+          echo "   PackageName: $PACKAGE_NAME" >> api-key-info.txt
+          echo "   SHA1: $DEBUG_SHA1" >> api-key-info.txt
+          cat >> api-key-info.txt << 'EOF_MARKER'
 4. 提交并复制 Key
 
 ======================================
 配置到 GitHub Repository Secrets
 ======================================
 
-访问: https://github.com/${{ github.repository }}/settings/environments
+EOF_MARKER
+          echo "访问: https://github.com/$REPO_PATH/settings/environments" >> api-key-info.txt
+          cat >> api-key-info.txt << 'EOF_MARKER'
 
 创建 Environment: Android Build
 添加以下 Secrets:
@@ -163,7 +178,7 @@ Google Maps API Key 配置步骤
   - AMAP_API_KEY = <你的高德地图API Key>
 
 ======================================
-EOF
+EOF_MARKER
           
           echo ""
           echo "✅ 配置信息已保存到 api-key-info.txt"
