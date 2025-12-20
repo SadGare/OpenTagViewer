@@ -19,7 +19,7 @@ import java.util.stream.Collectors;
  * SDK依赖配置：
  * dependencies {
  *     implementation 'com.amap.api:3dmap:9.8.3'
- *     implementation 'com.amap.api:location:6.4.7'
+ *     // 注意：3D地图SDK已包含定位功能，无需单独引入location SDK
  * }
  * 
  * API Key配置：

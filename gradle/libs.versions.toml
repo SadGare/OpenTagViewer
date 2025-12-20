@@ -33,7 +33,6 @@ desugarJdkLibs = "2.1.5"
 emojiPicker = "1.5.0"
 cronetEmbedded = "119.6045.31"
 amapVersion = "9.8.3"
-amapLocationVersion = "6.4.7"
 
 [libraries]
 junit = { group = "junit", name = "junit", version.ref = "junit" }
@@ -78,7 +77,6 @@ androidx-emoji-views = { group = "androidx.emoji2", name = "emoji2-views", versi
 androidx-emoji-views-helper = { group = "androidx.emoji2", name = "emoji2-views-helper", version.ref = "emojiPicker" }
 androidx-emoji-picker = { group = "androidx.emoji2", name = "emoji2-emojipicker", version.ref = "emojiPicker" }
 amap-map3d = { group = "com.amap.api", name = "3dmap", version.ref = "amapVersion" }
-amap-location = { group = "com.amap.api", name = "location", version.ref = "amapLocationVersion" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
