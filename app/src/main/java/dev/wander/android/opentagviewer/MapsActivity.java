@@ -156,9 +156,7 @@ public class MapsActivity extends AppCompatActivity implements IMapProvider.OnMa
     private final Map<String, List<BeaconLocationReport>> beaconLocations = new ConcurrentHashMap<>();
 
     private final Map<String, String> currentMarkers = new ConcurrentHashMap<>(); // 存储markerId
-    private Marker lastFocusedMarker; // 保留用于向后兼容（仅Google Maps）
-
-    private Marker lastFocusedMarker = null;
+    private Marker lastFocusedMarker = null; // 保留用于向后兼容（仅Google Maps）
 
     private final Map<String, FrameLayout> dynamicCardsForTag = new ConcurrentHashMap<>();
 
