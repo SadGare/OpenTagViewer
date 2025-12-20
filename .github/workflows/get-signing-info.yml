@@ -22,6 +22,19 @@ jobs:
       - name: 赋予 Gradlew 执行权限
         run: chmod +x gradlew
       
+      - name: 生成 Debug Keystore
+        run: |
+          echo "======================================"
+          echo "正在生成 Debug Keystore..."
+          echo "======================================"
+          mkdir -p $HOME/.android
+          keytool -genkey -v -keystore $HOME/.android/debug.keystore \
+            -storepass android -alias androiddebugkey -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          echo "✅ Debug Keystore 已生成"
+          echo ""
+      
       - name: 生成签名报告
         run: |
           echo "======================================"
@@ -43,9 +56,16 @@ jobs:
           echo "   $PACKAGE_NAME"
           echo ""
           
-          # 提取 Debug SHA1
+          # 使用 keytool 直接读取 Debug SHA1（更可靠）
           echo "🔐 Debug SHA1 指纹 (用于开发测试):"
-          ./gradlew signingReport --no-daemon 2>/dev/null | grep -A 2 "Variant: debug" | grep "SHA1:" | sed 's/.*SHA1: /   /'
+          DEBUG_SHA1=$(keytool -list -v -keystore $HOME/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android 2>/dev/null | grep "SHA1:" | sed 's/.*SHA1: //')
+          echo "   $DEBUG_SHA1"
+          echo ""
+          
+          # 同时提取 SHA256（某些平台可能需要）
+          echo "🔐 Debug SHA256 指纹 (备用):"
+          DEBUG_SHA256=$(keytool -list -v -keystore $HOME/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android 2>/dev/null | grep "SHA256:" | sed 's/.*SHA256: //')
+          echo "   $DEBUG_SHA256"
           echo ""
           
           # 提取 Release SHA1 (如果有)
@@ -62,46 +82,121 @@ jobs:
           echo "📝 如何使用这些信息"
           echo "======================================"
           echo ""
-          echo "1. Google Maps API Key 配置:"
-          echo "   - 包名: $PACKAGE_NAME"
-          echo "   - SHA1: 见上方 Debug SHA1 指纹"
+          
+          # 保存变量供后续使用
+          DEBUG_SHA1=$(keytool -list -v -keystore $HOME/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android 2>/dev/null | grep "SHA1:" | sed 's/.*SHA1: //')
+          
+          echo "【Google Maps API Key 配置】"
+          echo "1. 访问: https://console.cloud.google.com/apis/credentials"
+          echo "2. 创建凭据 → API 密钥"
+          echo "3. 限制密钥 → 选择「Android 应用」"
+          echo "4. 添加包名称和指纹:"
+          echo "   - 包名称: $PACKAGE_NAME"
+          echo "   - SHA-1 证书指纹: $DEBUG_SHA1"
+          echo "5. 保存后复制 API Key"
           echo ""
-          echo "2. 高德地图 API Key 配置:"
-          echo "   - 包名: $PACKAGE_NAME"
-          echo "   - SHA1: 见上方 Debug SHA1 指纹"
+          echo "【高德地图 API Key 配置】"
+          echo "1. 访问: https://console.amap.com/dev/key/app"
+          echo "2. 创建新应用 → 添加 Key"
+          echo "3. 服务平台选择「Android 平台」"
+          echo "4. 填写信息:"
+          echo "   - PackageName: $PACKAGE_NAME"
+          echo "   - 发布版安全码 SHA1: $DEBUG_SHA1"
+          echo "5. 提交后复制 Key"
           echo ""
-          echo "3. 配置步骤:"
-          echo "   a) 将 SHA1 指纹复制到 API 控制台"
-          echo "   b) 包名填写: $PACKAGE_NAME"
-          echo "   c) 获取 API Key 后填入 secrets.properties"
+          echo "【配置到 GitHub Secrets】"
+          echo "访问: https://github.com/${{ github.repository }}/settings/secrets/actions"
+          echo ""
+          echo "在 Environment 'Android Build' 中添加:"
+          echo "  - MAPS_API_KEY = <你的Google Maps API Key>"
+          echo "  - AMAP_API_KEY = <你的高德地图API Key>"
           echo ""
           echo "======================================"
+          
+          # 将信息保存到文件
+          cat > api-key-info.txt << EOF
+======================================
+API Key 配置信息
+======================================
+
+📦 包名 (Package Name):
+$PACKAGE_NAME
+
+🔐 Debug SHA1 指纹:
+$DEBUG_SHA1
+
+🔐 Debug SHA256 指纹:
+$(keytool -list -v -keystore $HOME/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android 2>/dev/null | grep "SHA256:" | sed 's/.*SHA256: //')
+
+======================================
+Google Maps API Key 配置步骤
+======================================
+
+1. 访问: https://console.cloud.google.com/apis/credentials
+2. 创建凭据 → API 密钥
+3. 限制密钥 → Android 应用
+4. 添加:
+   包名称: $PACKAGE_NAME
+   SHA-1 指纹: $DEBUG_SHA1
+5. 保存并复制 API Key
+
+======================================
+高德地图 API Key 配置步骤
+======================================
+
+1. 访问: https://console.amap.com/dev/key/app
+2. 创建应用 → 添加 Key → Android 平台
+3. 填写:
+   PackageName: $PACKAGE_NAME
+   SHA1: $DEBUG_SHA1
+4. 提交并复制 Key
+
+======================================
+配置到 GitHub Repository Secrets
+======================================
+
+访问: https://github.com/${{ github.repository }}/settings/environments
+
+创建 Environment: Android Build
+添加以下 Secrets:
+  - MAPS_API_KEY = <你的Google Maps API Key>
+  - AMAP_API_KEY = <你的高德地图API Key>
+
+======================================
+EOF
+          
+          echo ""
+          echo "✅ 配置信息已保存到 api-key-info.txt"
       
       - name: 生成完整签名报告文件
         run: |
           ./gradlew signingReport --no-daemon > signing-report.txt 2>&1
           echo "完整的签名报告已保存到 signing-report.txt"
       
-      - name: 上传签名报告
+      - name: 上传配置信息文件
         uses: actions/upload-artifact@v4
         with:
-          name: signing-report
-          path: signing-report.txt
+          name: api-key-configuration-info
+          path: |
+            api-key-info.txt
+            signing-report.txt
           retention-days: 7
       
-      - name: 显示完整报告路径
+      - name: 显示完成信息
         run: |
           echo ""
           echo "======================================"
           echo "✅ 完成！"
           echo "======================================"
           echo ""
-          echo "完整的签名报告已上传为 Artifact，可在 Actions 页面下载。"
+          echo "📥 配置信息已上传为 Artifact"
+          echo "   在本页面顶部可下载 'api-key-configuration-info'"
           echo ""
-          echo "下一步操作："
-          echo "1. 复制上方的 SHA1 指纹"
-          echo "2. 访问 https://console.cloud.google.com/apis/credentials"
-          echo "3. 创建 API 密钥并添加 Android 限制"
-          echo "4. 填入包名和 SHA1 指纹"
+          echo "📋 下一步操作:"
+          echo "1. ⬆️  向上滚动查看完整的 SHA1 指纹和包名"
+          echo "2. 📥 或下载 Artifact 中的 api-key-info.txt 文件"
+          echo "3. 🔑 按照说明到 Google/高德平台申请 API Key"
+          echo "4. 🔐 将 API Key 添加到 GitHub Secrets"
+          echo "5. 🚀 推送代码，GitHub Actions 会自动构建"
           echo ""
 
