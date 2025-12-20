@@ -55,6 +55,8 @@ import com.google.android.gms.maps.GoogleMap.OnMapClickListener;
 
 import dev.wander.android.opentagviewer.ui.maps.IMapProvider;
 import dev.wander.android.opentagviewer.ui.maps.MapProviderFactory;
+import dev.wander.android.opentagviewer.ui.maps.GoogleMapProvider;
+import dev.wander.android.opentagviewer.ui.maps.AMapProvider;
 import dev.wander.android.opentagviewer.ui.maps.MapMarker;
 import dev.wander.android.opentagviewer.ui.maps.MapPolyline;
 import com.google.android.libraries.places.api.Places;
