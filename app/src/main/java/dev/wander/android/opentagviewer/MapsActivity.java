@@ -292,10 +292,10 @@ public class MapsActivity extends AppCompatActivity implements IMapProvider.OnMa
 
         // 根据用户设置创建地图提供商
         String mapProviderType = this.userSettings.getMapProvider();
-        this.mapProvider = MapProviderFactory.create(mapProviderType);
+        IMapProvider tempProvider = MapProviderFactory.create(mapProviderType);
         
-        // 初始化地图
-        this.mapProvider.initialize(this, R.id.map, this);
+        // 初始化地图（注意：this.mapProvider 仅在 onMapReady 后赋值，避免初始化竞态）
+        tempProvider.initialize(this, R.id.map, this);
     }
 
 
@@ -331,6 +331,9 @@ public class MapsActivity extends AppCompatActivity implements IMapProvider.OnMa
         }
 
         this.enableMyLocation(false);
+
+        // 地图准备好后，刷新一次当前显示的信标位置
+        this.showLastDeviceLocations();
     }
 
     @Override

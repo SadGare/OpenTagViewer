@@ -31,6 +31,36 @@ public class OpenAirTagApplication extends PyApplication {
      */
     private void initAMapPrivacyCompliance() {
         try {
+            // FIX: 尝试读取并修复可能被误解析为Integer的AMap API Key
+            try {
+                android.content.pm.ApplicationInfo appInfo = this.getPackageManager().getApplicationInfo(this.getPackageName(), android.content.pm.PackageManager.GET_META_DATA);
+                if (appInfo.metaData != null) {
+                    Object keyObj = appInfo.metaData.get("com.amap.api.v2.apikey");
+                    if (keyObj instanceof Integer) {
+                        Log.w(TAG, "AMap API Key was parsed as Integer (" + keyObj + "), converting to String...");
+                        String keyStr;
+                        try {
+                            // 尝试作为资源ID读取
+                            keyStr = this.getString((Integer) keyObj);
+                        } catch (Exception e) {
+                            // 否则直接转换为字符串
+                            keyStr = String.valueOf(keyObj);
+                        }
+                        
+                        Log.i(TAG, "Recovered AMap Key: " + keyStr);
+
+                        // 尝试通过反射设置Key
+                        // com.amap.api.maps.MapsInitializer.setApiKey(String)
+                        Class<?> mapsInitializerClass = Class.forName("com.amap.api.maps.MapsInitializer");
+                        java.lang.reflect.Method setApiKeyMethod = mapsInitializerClass.getMethod("setApiKey", String.class);
+                        setApiKeyMethod.invoke(null, keyStr);
+                        Log.i(TAG, "Successfully set AMap API Key manually via reflection");
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to fix AMap API Key", e);
+            }
+
             // 使用反射加载高德地图SDK，避免编译时依赖
             Class<?> mapsInitializerClass = Class.forName("com.amap.api.maps.MapsInitializer");
             

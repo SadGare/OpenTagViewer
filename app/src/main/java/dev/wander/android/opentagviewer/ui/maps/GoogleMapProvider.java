@@ -149,7 +149,12 @@ public class GoogleMapProvider implements IMapProvider, OnMapReadyCallback {
         
         // 设置图标
         if (marker.getIconBitmap() != null) {
-            options.icon(BitmapDescriptorFactory.fromBitmap(marker.getIconBitmap()));
+            try {
+                options.icon(BitmapDescriptorFactory.fromBitmap(marker.getIconBitmap()));
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to create icon from bitmap, falling back to default", e);
+                options.icon(BitmapDescriptorFactory.defaultMarker());
+            }
         } else if (marker.getIconResourceId() != 0) {
             options.icon(BitmapDescriptorFactory.fromResource(marker.getIconResourceId()));
         } else if (!marker.isUseDefaultIcon()) {
