@@ -90,6 +90,9 @@ chaquopy {
         version = "3.12"
         pip {
             // SEE: https://chaquo.com/chaquopy/doc/current/android.html#android-requirements
+            // Stub wheel satisfies anisette's unicorn>=2.1.1 dependency without native compilation.
+            // We only use RemoteAnisetteProvider so unicorn is never actually instantiated.
+            install("libs/unicorn-2.1.1-py3-none-any.whl")
             install("FindMy==0.9.8")
             install("NSKeyedUnArchiver==1.5")
         }
