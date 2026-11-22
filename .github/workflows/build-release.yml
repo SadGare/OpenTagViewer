@@ -10,6 +10,7 @@ env:
 on:
   release:
     types: published
+  workflow_dispatch:
 
 jobs:
   build:
@@ -22,11 +23,12 @@ jobs:
     permissions:
       contents: write
 
-    # Only run this for 'android-app-v<whatever>' tags!
+    # Build on demand, or publish for 'android-app-v<whatever>' tags.
     if: |
-      github.event_name == 'release'
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'release'
       && (github.event.release.prerelease == true || github.event.release.published_at != null)
-      && startsWith(github.event.release.tag_name, 'android-app-v')
+      && startsWith(github.event.release.tag_name, 'android-app-v'))
 
     steps:
       - name: Checkout code
@@ -41,11 +43,15 @@ jobs:
       # tag only has to agree with it, which is the same arrangement the macOS exporter has
       # used since scripts/release_version.py was introduced. It runs before the Gradle build,
       # so a mismatch costs seconds rather than a full signed build.
-      - name: Check the release tag matches the version in the source
+      - name: Read the version and verify the tag for releases
         id: extract_version
         run: |
-          APP_VERSION="$(python3 scripts/release_version.py --kind android --tag "${{ github.ref }}")"
-          echo "Tag and source agree on version: $APP_VERSION"
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+            APP_VERSION="$(python3 scripts/release_version.py --kind android --tag "$GITHUB_REF")"
+          else
+            APP_VERSION="$(python3 scripts/release_version.py --kind android --print)"
+          fi
+          echo "APK version: $APP_VERSION"
           echo "APP_VERSION=$APP_VERSION" >> $GITHUB_OUTPUT
 
       # Set Current Date As Env Variable
@@ -103,6 +109,7 @@ jobs:
         run: python -m pytest app/src/test/python -v
 
       - name: Build gradle project
+        if: github.event_name == 'release'
         run: ./gradlew build -x lint
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
@@ -110,6 +117,7 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
       - name: Build APK Debug
+        if: github.event_name == 'release'
         run: |
           ./gradlew assembleDebug
           # rename debug build
@@ -137,18 +145,13 @@ jobs:
       # Upload Artifact Build
       # Noted For Output [main_project_module]/build/outputs/apk/debug/
       - name: Upload APK Debug
+        if: github.event_name == 'release'
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.date_today }} - ${{ env.app_name }} - ${{ env.repository_name }} - APK(s) debug generated
           path: ${{ env.main_project_module }}/build/outputs/apk/debug/
 
       # Noted For Output [main_project_module]/build/outputs/apk/release/
-      - name: Upload APK Release
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.date_today }} - ${{ env.app_name }} - ${{ env.repository_name }} - APK(s) release generated
-          path: ${{ env.main_project_module }}/build/outputs/apk/release/
-
       # The token goes in `with:`, not `env:`. This action's `token` input defaults to
       # ${{ github.token }}, and its own docs say "a non-empty explicit token overrides
       # GITHUB_TOKEN" - so the default is always non-empty and an env var is ignored entirely.
@@ -162,7 +165,6 @@ jobs:
       # exact tarball the build used goes on the release beside the APK, checked against the hash
       # MacAdi.cmake pins, and the APK's assets/licences/unicorn/NOTICE.txt says where it is.
       - name: Fetch Unicorn's source, as the APK was built from it
-        if: github.event_name == 'release'
         run: |
           url=$(sed -n 's/^ *URL \(https:[^ ]*unicorn[^ ]*\.tar\.gz\)$/\1/p' app/src/main/cpp/macadi/MacAdi.cmake)
           sha=$(sed -n 's/^ *URL_HASH SHA256=\([0-9a-f]*\).*/\1/p' app/src/main/cpp/macadi/MacAdi.cmake)
@@ -170,6 +172,14 @@ jobs:
           curl -sSfL "$url" -o "unicorn-$(basename "$url")"
           echo "$sha  unicorn-$(basename "$url")" | sha256sum -c -
           echo "UNICORN_SOURCE=unicorn-$(basename "$url")" >> "$GITHUB_ENV"
+
+      - name: Upload APK Release
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.date_today }} - ${{ env.app_name }} - ${{ env.repository_name }} - APK(s) release generated
+          path: |
+            ${{ env.main_project_module }}/build/outputs/apk/release/*.apk
+            ${{ env.UNICORN_SOURCE }}
 
       - name: Upload APK Release Asset to GitHub Release
         uses: softprops/action-gh-release@v2
