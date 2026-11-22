@@ -16,6 +16,8 @@ import java.util.Map;
 import dev.wander.android.opentagviewer.data.model.BeaconLocationReport;
 import io.reactivex.rxjava3.core.Observable;
 import io.reactivex.rxjava3.schedulers.Schedulers;
+import java.util.HashSet;
+import java.util.Set;
 
 public class PythonAppleService {
     private static final String TAG = PythonAppleService.class.getSimpleName();
@@ -26,17 +28,114 @@ public class PythonAppleService {
 
     public static PythonAppleService INSTANCE = null;
 
+    /**
+     * Take this account as the signed-in one, closing whatever was here before.
+     *
+     * <p><b>Replacing used to leak the old one.</b> An {@code AppleAccount} owns an aiohttp
+     * session, a connector and an event loop, and dropping the reference releases none of it -
+     * Python's collector tries and fails, leaving two sockets open per discarded account. This
+     * screen is rebuilt on any theme, language or map-provider change, so somebody toggling dark
+     * mode a few times accumulates them. See issue #133.
+     */
     public static PythonAppleService setup(PythonAppleAccount account) {
+        final PythonAppleService previous = INSTANCE;
+
         INSTANCE = new PythonAppleService(account);
+
+        if (previous != null && previous.account != account) {
+            closeQuietly(previous.account);
+        }
+
         return INSTANCE;
+    }
+
+    /**
+     * Let go of the signed-in account, closing it.
+     *
+     * <p>For signing out, which is the clearest case of an account nobody will use again. Safe
+     * to call when there is none.
+     */
+    public static void forget() {
+        final PythonAppleService previous = INSTANCE;
+        INSTANCE = null;
+
+        if (previous != null) {
+            closeQuietly(previous.account);
+        }
+    }
+
+    /**
+     * Close an account's session, and never fail for it.
+     *
+     * <p>Every caller is discarding the account regardless, so there is nothing useful to do
+     * about a failure except say so - and this runs on paths that are already recovering from
+     * something else, where a new exception would replace the original problem with this one.
+     */
+    private static void closeQuietly(final PythonAppleAccount account) {
+        if (account == null) {
+            return;
+        }
+
+        try {
+            PythonLock.holding(() -> {
+                final var module = Python.getInstance().getModule(MODULE_MAIN);
+                module.callAttr("closeAccount", new Kwarg("account", account.getAccountObj()));
+                return null;
+            });
+        } catch (final Exception e) {
+            Log.w(TAG, "Could not close a discarded Apple account", e);
+        }
     }
 
     public static PythonAppleService getInstance() {
         return INSTANCE;
     }
 
+    /**
+     * Whether a fetch or an account change is currently in progress.
+     *
+     * <p>Delegates to {@link PythonLock}. Kept here because the periodic refresh asks this
+     * service, and where the lock lives is not its business.
+     */
+    public static boolean isBusy() {
+        return PythonLock.isBusy();
+    }
+
     private PythonAppleService(PythonAppleAccount account) {
         this.account = account;
+    }
+
+    /**
+     * The signed-in account, for the iCloud flow.
+     *
+     * <p><b>This one, not a second one restored from the same stored JSON.</b> One install is
+     * one device to Apple (rule 11), and a parallel account would be a second HTTP session on a
+     * second event loop presenting the same identity.
+     */
+    public PythonAppleAccount getAccount() {
+        return this.account;
+    }
+
+    /**
+     * The account to fetch with, read once the caller holds {@link PythonLock}.
+     *
+     * <p><b>Not necessarily this service's own.</b> A theme or language change rebuilds
+     * {@code MapsActivity}, which restores a fresh account and closes this one in {@link #setup},
+     * under the lock. A fetch queued on the lock behind that swap then ran against the closed
+     * account and failed. The fetch is still worth making, so it goes to whichever account is
+     * signed in now. Null after a sign-out.
+     */
+    private PythonAppleAccount accountToFetchWith() {
+        final PythonAppleService now = INSTANCE;
+        if (now == this) {
+            return this.account;
+        }
+        if (now == null) {
+            Log.i(TAG, "Signed out while this fetch was waiting; skipping it");
+            return null;
+        }
+        Log.i(TAG, "The account was replaced while this fetch was waiting; using the new one");
+        return now.account;
     }
 
     public Observable<FetchResult> getLastReports(final List<AccessoryRequest> requests, final int hoursToGoBack) {
@@ -45,23 +144,29 @@ public class PythonAppleService {
                 return emptyResult();
             }
 
-            var py = Python.getInstance();
-            var module = py.getModule(MODULE_MAIN);
+            return PythonLock.holding(() -> {
+                final PythonAppleAccount fetchWith = this.accountToFetchWith();
+                if (fetchWith == null) {
+                    return emptyResult();
+                }
 
-            var returned = module.callAttr(
-                    "getLastReports",
-                    new Kwarg("account", this.account.getAccountObj()),
-                    new Kwarg("idToAccessoryData", requests),
-                    new Kwarg("hoursBack", hoursToGoBack)
-            );
+                var py = Python.getInstance();
+                var module = py.getModule(MODULE_MAIN);
 
-            if (returned == null) {
-                Log.e(TAG, "python call to getLastReports resulted in error (check python logs for details)");
-                throw new PythonAppleFindMyException("Error while retrieving last reports for account via python!");
-            }
+                var returned = module.callAttr(
+                        "getLastReports",
+                        new Kwarg("account", fetchWith.getAccountObj()),
+                        new Kwarg("idToAccessoryData", requests),
+                        new Kwarg("hoursBack", hoursToGoBack)
+                );
 
-            return mapResults(returned);
+                if (returned == null) {
+                    Log.e(TAG, "python call to getLastReports resulted in error (check python logs for details)");
+                    throw new PythonAppleFindMyException("Error while retrieving last reports for account via python!");
+                }
 
+                return mapResults(returned);
+            });
         }).subscribeOn(Schedulers.io());
     }
 
@@ -71,28 +176,36 @@ public class PythonAppleService {
                 return emptyResult();
             }
 
-            var py = Python.getInstance();
-            var module = py.getModule(MODULE_MAIN);
+            return PythonLock.holding(() -> {
+                final PythonAppleAccount fetchWith = this.accountToFetchWith();
+                if (fetchWith == null) {
+                    return emptyResult();
+                }
 
-            var returned = module.callAttr(
-                    "getReports",
-                    new Kwarg("account", this.account.getAccountObj()),
-                    new Kwarg("idToAccessoryData", requests),
-                    new Kwarg("unixStartMs", startTimeUnixMS),
-                    new Kwarg("unixEndMs", endTimeUnixMS)
-            );
+                var py = Python.getInstance();
+                var module = py.getModule(MODULE_MAIN);
 
-            if (returned == null) {
-                Log.e(TAG, "python call to getReports resulted in error (check python logs for details)");
-                throw new PythonAppleFindMyException("Error while retrieving time ranged reports for account via python!");
-            }
+                var returned = module.callAttr(
+                        "getReports",
+                        new Kwarg("account", fetchWith.getAccountObj()),
+                        new Kwarg("idToAccessoryData", requests),
+                        new Kwarg("unixStartMs", startTimeUnixMS),
+                        new Kwarg("unixEndMs", endTimeUnixMS)
+                );
 
-            return mapResults(returned);
+                if (returned == null) {
+                    Log.e(TAG, "python call to getReports resulted in error (check python logs for details)");
+                    throw new PythonAppleFindMyException("Error while retrieving time ranged reports for account via python!");
+                }
+
+                return mapResults(returned);
+            });
         }).subscribeOn(Schedulers.io());
     }
 
     private static FetchResult emptyResult() {
-        return new FetchResult(Collections.emptyMap(), Collections.emptyMap());
+        return new FetchResult(Collections.emptyMap(), Collections.emptyMap(),
+                Set.of(), Set.of());
     }
 
     /**
@@ -105,6 +218,8 @@ public class PythonAppleService {
     private static FetchResult mapResults(final PyObject locationReportsResult) {
         Map<String, List<BeaconLocationReport>> results = new HashMap<>();
         Map<String, String> updatedAccessoryJson = new HashMap<>();
+        Set<String> exhaustedWideSearch = new HashSet<>();
+        Set<String> wideSearch = new HashSet<>();
 
         var mapBeaconIdToResult = locationReportsResult.asMap();
         for (var key : mapBeaconIdToResult.keySet()) {
@@ -112,6 +227,21 @@ public class PythonAppleService {
 
             var locationReportList = perBeacon.get("reports").asList();
             var updatedAccessory = perBeacon.get("updatedAccessoryJson");
+
+            // Absent on any answer from an older bridge, which reads as "not exhausted" - the
+            // cautious way round, since the consequence of a wrong true is the app quietly
+            // giving up on somebody's tag.
+            final var exhausted = perBeacon.get("exhaustedWideSearch");
+            if (exhausted != null && exhausted.toBoolean()) {
+                exhaustedWideSearch.add(key.toString());
+            }
+
+            // Absent on an older bridge, which reads as "not expensive" - so nothing is counted
+            // against a tag on the strength of a field that was not there.
+            final var wide = perBeacon.get("wideSearch");
+            if (wide != null && wide.toBoolean()) {
+                wideSearch.add(key.toString());
+            }
 
             List<BeaconLocationReport> reports = new LinkedList<>();
             final int numReports = locationReportList.size();
@@ -149,6 +279,6 @@ public class PythonAppleService {
             }
         }
 
-        return new FetchResult(results, updatedAccessoryJson);
+        return new FetchResult(results, updatedAccessoryJson, exhaustedWideSearch, wideSearch);
     }
 }

@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 import dev.wander.android.opentagviewer.R;
+import androidx.fragment.app.FragmentActivity;
 
 /**
  * Google Maps地图提供商实现
@@ -53,11 +54,11 @@ public class GoogleMapProvider implements IMapProvider, OnMapReadyCallback {
         this.activity = activity;
         this.callback = callback;
         
-        if (!(activity instanceof androidx.fragment.app.FragmentActivity)) {
+        if (!(activity instanceof FragmentActivity)) {
             throw new IllegalArgumentException("Activity must be a FragmentActivity to use Google Maps");
         }
         
-        FragmentManager fragmentManager = ((androidx.fragment.app.FragmentActivity) activity).getSupportFragmentManager();
+        FragmentManager fragmentManager = ((FragmentActivity) activity).getSupportFragmentManager();
         
         // 查找或创建SupportMapFragment
         mapFragment = (SupportMapFragment) fragmentManager.findFragmentById(containerViewId);
@@ -158,7 +159,8 @@ public class GoogleMapProvider implements IMapProvider, OnMapReadyCallback {
                 .snippet(marker.getSnippet())
                 .draggable(marker.isDraggable())
                 .visible(marker.isVisible())
-                .alpha(marker.getAlpha());
+                .alpha(marker.getAlpha())
+                .zIndex(marker.getZIndex());
         
         // 设置图标
         if (marker.getIconBitmap() != null) {
@@ -187,6 +189,16 @@ public class GoogleMapProvider implements IMapProvider, OnMapReadyCallback {
         if (marker != null) {
             marker.remove();
         }
+    }
+
+    @Override
+    public void setMarkerZIndex(String markerId, float zIndex) {
+        Marker marker = markers.get(markerId);
+        if (marker == null) {
+            Log.d(TAG, "No marker to re-order for markerId=" + markerId);
+            return;
+        }
+        marker.setZIndex(zIndex);
     }
     
     @Override
@@ -318,6 +330,18 @@ public class GoogleMapProvider implements IMapProvider, OnMapReadyCallback {
     public void setMyLocationButtonEnabled(boolean enabled) {
         if (googleMap == null) return;
         googleMap.getUiSettings().setMyLocationButtonEnabled(enabled);
+    }
+
+    @Override
+    public void setMyLocationEnabled(boolean enabled) {
+        if (googleMap == null) return;
+        try {
+            googleMap.setMyLocationEnabled(enabled);
+        } catch (final SecurityException e) {
+            // The caller checks the permission before asking, so this is the race where it was
+            // revoked in between. Not worth taking the map down for.
+            Log.w(TAG, "No location permission, so the position dot stays off", e);
+        }
     }
     
     @Override

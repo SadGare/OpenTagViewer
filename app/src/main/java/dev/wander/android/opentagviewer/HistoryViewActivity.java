@@ -9,7 +9,6 @@ import static com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_
 
 import android.annotation.SuppressLint;
 import android.content.Intent;
-import android.location.Geocoder;
 import android.os.Bundle;
 import android.text.format.DateFormat;
 import android.util.Log;
@@ -83,9 +82,12 @@ import dev.wander.android.opentagviewer.db.repo.model.UserSettings;
 import dev.wander.android.opentagviewer.db.room.OpenTagViewerDatabase;
 import dev.wander.android.opentagviewer.db.room.entity.DailyHistoryFetchRecord;
 import dev.wander.android.opentagviewer.db.util.BeaconCombinerUtil;
+import dev.wander.android.opentagviewer.source.ReportSources;
+import dev.wander.android.opentagviewer.python.AppDependencies;
 import dev.wander.android.opentagviewer.python.PythonAppleService;
 import dev.wander.android.opentagviewer.ui.compat.WindowPaddingUtil;
 import dev.wander.android.opentagviewer.ui.history.HistoryItemsAdapter;
+import dev.wander.android.opentagviewer.util.android.AddressLookup;
 import dev.wander.android.opentagviewer.util.parse.BeaconDataParser;
 import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers;
 import io.reactivex.rxjava3.core.Completable;
@@ -114,7 +116,7 @@ public class HistoryViewActivity extends AppCompatActivity implements IMapProvid
     private UserSettingsRepository userSettingsRepo;
     private PythonAppleService appleService;
 
-    private Geocoder geocoder = null;
+    private AddressLookup geocoder = null;
 
     private UserSettings userSettings;
 
@@ -168,7 +170,8 @@ public class HistoryViewActivity extends AppCompatActivity implements IMapProvid
 
         this.appleService = PythonAppleService.getInstance();
 
-        this.geocoder = new Geocoder(this.getApplicationContext(), Locale.getDefault());
+        this.geocoder = AppDependencies.geocoder(
+                this.getApplicationContext(), Locale.getDefault());
 
         this.userSettings = this.userSettingsRepo.getUserSettings();
 
@@ -178,7 +181,6 @@ public class HistoryViewActivity extends AppCompatActivity implements IMapProvid
                 .blockingFirst();
 
         ActivityHistoryViewBinding binding = DataBindingUtil.setContentView(this, R.layout.activity_history_view);
-        WindowPaddingUtil.insertUITopPadding(binding.getRoot());
 
         binding.setHandleClickBack(this::finish);
         binding.setPageTitle(this.getCurrentBeaconName());
@@ -200,6 +202,14 @@ public class HistoryViewActivity extends AppCompatActivity implements IMapProvid
                 this::handleOnClickHistoryListItem
         );
         RecyclerView recyclerView = findViewById(R.id.recycler_view_history_items);
+
+        // **The bottom inset goes on the list, not on the root.** Padding the root shortens the
+        // coordinator inside it, so the sheet stopped above the navigation bar and the white
+        // activity background showed through beneath a grey sheet - with the last history row
+        // clipped by the same gap. Paired call, so the bottom cannot be left out: see
+        // WindowPaddingUtil.
+        WindowPaddingUtil.insetForSystemBars(binding.getRoot(), recyclerView);
+
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
         recyclerView.setAdapter(this.historyItemsAdapter);
         recyclerView.setItemAnimator(null);
@@ -207,7 +217,7 @@ public class HistoryViewActivity extends AppCompatActivity implements IMapProvid
         // Obtain the SupportMapFragment and get notified when the map is ready to be used.
         // 根据用户设置创建地图提供商
         String mapProviderType = this.userSettings.getMapProvider();
-        this.mapProvider = MapProviderFactory.create(mapProviderType);
+        this.mapProvider = MapProviderFactory.create(MapProviderFactory.effectiveProvider(this, mapProviderType));
         
         // 初始化地图
         this.mapProvider.initialize(this, R.id.history_map, this);
@@ -372,54 +382,78 @@ public class HistoryViewActivity extends AppCompatActivity implements IMapProvid
     private Observable<List<BeaconLocationReport>> fetchReports(final long beginningOfDay, final long endOfDay, final String cacheKey) {
         final boolean isForToday = this.daysBack == 0;
 
-        var reqData = Map.of(this.beaconId, this.beaconInformation.getOwnedBeaconPlistRaw());
+        // Not Map.of: a self-generated tag has no plist, and Map.of throws on a null value -
+        // which crashed this screen the moment one was opened.
+        var reqData = BeaconRepository.plistFallback(
+                this.beaconId, this.beaconInformation.getOwnedBeaconPlistRaw());
         // asyncReq emits Observable<FetchResult> (reports + updated accessory state per beacon)
+        // Each device through its own sources: the Apple account and Google Find Hub - see
+        // ReportSources.
         var asyncReq = this.beaconRepo.toAccessoryRequests(reqData)
-                .flatMap(requests -> this.appleService.getReportsBetween(requests, beginningOfDay, endOfDay));
+                .flatMap(requests -> Observable.fromIterable(requests)
+                        .concatMap(request -> ReportSources.create(this).fetch(
+                                request, beginningOfDay, endOfDay, false,
+                                this.appleService == null ? null
+                                        : this.appleService.getReportsBetween(List.of(request), beginningOfDay, endOfDay))));
 
-        final long now = System.currentTimeMillis();
-        if (beginningOfDay < now - SEVEN_DAYS_IN_MS) {
-            // we have a small issue here: the api does not seem to return data older than 7 days.
-            // so if we are trying to fetch anything older than 7 days,
-            // try to retrieve it from our local DB/cache, too.
+        // **What Apple returns is merged with what we already hold, for every day.**
+        //
+        // This used to merge only for days older than a week, on the reasoning that Apple stops
+        // serving history beyond seven days so the local copy is the only source there. True,
+        // and it left the far more common case wrong: inside the week the screen took the
+        // remote answer alone and discarded rows already in the database.
+        //
+        // Those rows are not stale duplicates - they are reports this app fetched and stored,
+        // often minutes earlier from the map. Apple returning nothing for a window is ordinary:
+        // reports age out, and a narrow key window covers less than the day being asked for. So
+        // a tag the map had just located showed an empty history, and going back a day and
+        // returning made reports appear - which is exactly the behaviour that got reported.
+        //
+        // Merging always is strictly better: the remote answer is still authoritative and still
+        // stored, combineAndSort de-duplicates by report, and the only difference is that
+        // reports the app already had stop being thrown away.
+        var asyncDB = this.beaconRepo.getLocationsFor(beaconId, beginningOfDay, endOfDay);
 
-            var asyncDB = this.beaconRepo.getLocationsFor(beaconId, beginningOfDay, endOfDay);
+        Log.d(TAG, "Going to perform a merged localdb + remote fetch for beaconId=" + beaconId
+                + " location data in range: " + beginningOfDay + "-" + endOfDay);
 
-            Log.d(TAG, "Going to perform a merged localdb + remote fetch for beaconId=" + beaconId + " location data in range: " + beginningOfDay + "-" + endOfDay);
-            return Observable.zip(
-                            // try to fetch remotely anyways and combine uniquely later
-                            asyncReq.flatMap(this.beaconRepo::storeFetchResult).map(locations -> locations.get(beaconId)),
-                            // also try to fetch from DB for same time range
-                            asyncDB,
-                            (locationsRemote, locationsLocal) -> {
-                                Log.d(TAG, "Got " + locationsRemote.size() + " locations from Apple server and got " + locationsLocal.size() + " locations from local DB for beaconId" + beaconId);
+        return Observable.zip(
+                        asyncReq.flatMap(this.beaconRepo::storeFetchResult)
+                                .map(locations -> locations.get(beaconId)),
+                        asyncDB,
+                        (locationsRemote, locationsLocal) -> {
+                            Log.d(TAG, "Got " + locationsRemote.size() + " locations from Apple"
+                                    + " server and got " + locationsLocal.size() + " locations"
+                                    + " from local DB for beaconId" + beaconId);
 
-                                // merge both lists for unique events
-                                var mergedList = BeaconCombinerUtil.combineAndSort(beaconId, locationsRemote, locationsLocal);
-                                Log.d(TAG, "Final merged location history list has " + mergedList.size() + " items!");
+                            // **Stored in full, shown for this day only.**
+                            //
+                            // The fetch above searches key indices rather than a clock range,
+                            // so Apple hands back sightings either side of the day asked for.
+                            // Those are kept and stored - they cost the same to find and would
+                            // otherwise be fetched again when the user steps to the next day -
+                            // but they must not be drawn on this one. The local half needs no
+                            // such filter: it comes from a day-bounded query.
+                            var remoteForThisDay = locationsRemote.stream()
+                                    .filter(report -> report.getTimestamp() >= beginningOfDay
+                                            && report.getTimestamp() < endOfDay)
+                                    .collect(Collectors.toList());
 
-                                return mergedList;
-                            }).doOnNext(locations -> {
-                        // Don't cache the current day (it could still update)!
-                        if (!isForToday) {
-                            MEMORY_REPORTS_CACHE.put(cacheKey, locations);
-                        }
-                    })
-                    .flatMap(locations -> this.storeLocationFetchToLocalDb(isForToday, beaconId, beginningOfDay).andThen(Observable.just(locations)))
-                    .subscribeOn(Schedulers.computation()); // cache this combination, there will be no more updates at this point
-        }
+                            var mergedList = BeaconCombinerUtil.combineAndSort(
+                                    beaconId, remoteForThisDay, locationsLocal);
+                            Log.d(TAG, "Final merged location history list has "
+                                    + mergedList.size() + " items!");
 
-        Log.d(TAG, "Going to perform a fresh fetch for beaconId=" + beaconId + " location data in range: " + beginningOfDay + "-" + endOfDay);
-        return asyncReq
-                .doOnNext(fetchResult -> {
+                            return mergedList;
+                        })
+                .doOnNext(locations -> {
                     // Don't cache the current day (it could still update)!
                     if (!isForToday) {
-                        MEMORY_REPORTS_CACHE.put(cacheKey, fetchResult.getReports().get(beaconId));
+                        MEMORY_REPORTS_CACHE.put(cacheKey, locations);
                     }
                 })
-                .flatMap(fetchResult -> this.storeLocationFetchToLocalDb(isForToday, beaconId, beginningOfDay).andThen(Observable.just(fetchResult)))
-                .flatMap(this.beaconRepo::storeFetchResult)
-                .map(locations -> locations.get(beaconId))
+                .flatMap(locations -> this.storeLocationFetchToLocalDb(
+                        isForToday, beaconId, beginningOfDay).andThen(Observable.just(locations)))
                 .subscribeOn(Schedulers.computation());
     }
 

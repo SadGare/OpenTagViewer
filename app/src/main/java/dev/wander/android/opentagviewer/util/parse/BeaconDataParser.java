@@ -7,6 +7,7 @@ import org.w3c.dom.Node;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 import javax.xml.xpath.XPath;
 import javax.xml.xpath.XPathConstants;
@@ -33,6 +34,14 @@ public final class BeaconDataParser {
     private static final String XPATH_STABLE_IDENTIFIER_FIRST_ITEM = "/plist/dict/key[.='stableIdentifier']/following-sibling::array[1]/*[1]";
 
     private static final String XPATH_REQUIRED_PRIVATE_KEY = "/plist/dict/key[.='privateKey']";
+
+    /**
+     * Presence only, never the value. This is one of the owner's devices' key material, and the
+     * question it answers here is what kind of thing the record is - see
+     * {@code BeaconInformation.isOwnDevice()} and findmy-export 06-output section 2.3.
+     */
+    private static final String XPATH_SECURE_LOCATIONS_SECRET =
+            "/plist/dict/key[.='secureLocationsSharedSecret']";
 
     private static final String TYPE_STRING = "string";
 
@@ -61,12 +70,22 @@ public final class BeaconDataParser {
             final XPathExpression systemVersionQuery = getXPathFor(xPath, "systemVersion", TYPE_STRING);
             final XPathExpression vendorIdQuery = getXPathFor(xPath, "vendorId", TYPE_INTEGER);
             final XPathExpression privateKeyNodeExistsQuery = xPath.compile(XPATH_REQUIRED_PRIVATE_KEY);
+            final XPathExpression secureLocationsSecretQuery =
+                    xPath.compile(XPATH_SECURE_LOCATIONS_SECRET);
 
             var res = new ArrayList<BeaconInformation>();
             for (var beaconData : rawBeaconData) {
                 UserBeaconOptions userOverrides = beaconData.getUserBeaconOptions();
 
-                final String beaconNamingRecordPList = beaconData.getBeaconNamingRecord().content;
+                // A tag that was never in an Apple account has neither plist to read - no
+                // OwnedBeacons entry, and no naming record, because nobody's iPad ever named
+                // it. Everything below is XPath over those two documents, so it is a different
+                // construction rather than the same one with nulls threaded through it.
+                if (CustomAccessoryParser.isCustomAccessory(beaconData)) {
+                    res.add(CustomAccessoryParser.parse(beaconData, userOverrides));
+                    continue;
+                }
+
                 final String ownedBeaconPList = beaconData.getOwnedBeaconInfo().content;
 
                 // Extract the most relevant fields from decrypted plist files
@@ -78,13 +97,34 @@ public final class BeaconDataParser {
                 // multiple `<some id>.plist` files per `beacon-identifier`.
                 // In my testing thus far the directory for a single `beacon-identifier`
                 // only contained a single `<some id>.plist` file.
-                final Document beaconNamingData = XmlParser.parse(beaconNamingRecordPList);
-                final String beaconNamingRecordIdentifier = getString(beaconNamingData, identifierQuery);
-                final String associatedBeacon = getString(beaconNamingData, associatedBeaconQuery);
-                final String emoji = getString(beaconNamingData, emojiQuery);
-                final String name = getString(beaconNamingData, nameQuery);
-                // nested PLIST evaluation (this contains some useful info)
-                var metaData = BeaconNamingRecordInnerParser.extractBeaconNamingRecordMetadata(xPath, beaconNamingData);
+                //
+                // **All of it is optional.** A zip always carries the pair, because its importer
+                // inner-joins them, but an account read directly does not have to: CloudKit
+                // holds no naming record for an accessory nobody ever named. That is not a
+                // broken tag and must not be treated as one - it is a tag with no name yet,
+                // which the user can give it like any other. Skipping it here made it look like
+                // the import had lost it.
+                String beaconId = beaconData.getBeaconId();
+                String beaconNamingRecordIdentifier = null;
+                String emoji = null;
+                String name = null;
+                Optional<BeaconNamingRecordCloudKitMetadata> metaData = Optional.empty();
+
+                if (beaconData.getBeaconNamingRecord() != null) {
+                    final Document beaconNamingData =
+                            XmlParser.parse(beaconData.getBeaconNamingRecord().content);
+                    beaconNamingRecordIdentifier = getString(beaconNamingData, identifierQuery);
+                    final String associatedBeacon =
+                            getString(beaconNamingData, associatedBeaconQuery);
+                    if (associatedBeacon != null && !associatedBeacon.isEmpty()) {
+                        beaconId = associatedBeacon;
+                    }
+                    emoji = getString(beaconNamingData, emojiQuery);
+                    name = getString(beaconNamingData, nameQuery);
+                    // nested PLIST evaluation (this contains some useful info)
+                    metaData = BeaconNamingRecordInnerParser.extractBeaconNamingRecordMetadata(
+                            xPath, beaconNamingData);
+                }
 
 
                 // Extract the most relevant fields from decrypted plist files
@@ -108,13 +148,19 @@ public final class BeaconDataParser {
                 final String stableIdentifier = getString(ownedBeacon, stableIdentifierQuery);
                 final String systemVersion = getString(ownedBeacon, systemVersionQuery);
                 final int vendorId = getInteger(ownedBeacon, vendorIdQuery);
+                final boolean secureLocationsSecret =
+                        isNodeNotEmpty(ownedBeacon, secureLocationsSecretQuery);
 
                 var extractedData = BeaconInformation.builder()
                         // BeaconNamingRecord
-                        .beaconId(associatedBeacon)
+                        .beaconId(beaconId)
                         .namingRecordId(beaconNamingRecordIdentifier)
                         .originalEmoji(emoji)
-                        .originalName(name)
+                        // What the tag's own record says it is, when nobody has ever named it -
+                        // "AirTag" rather than a blank row. Not a name pretending to be the
+                        // user's choice: it is what Find My shows for an unnamed accessory,
+                        // and renaming it works exactly as it does for any other tag.
+                        .originalName(name == null || name.isEmpty() ? model : name)
                         // BeaconNamingRecord->cloudKitMetadata
                         .namingRecordModifiedTime(
                                 metaData.map(BeaconNamingRecordCloudKitMetadata::getModifiedTime).orElse(null))
@@ -130,12 +176,19 @@ public final class BeaconDataParser {
                         .stableIdentifier(List.of(stableIdentifier))
                         .systemVersion(systemVersion)
                         .vendorId(vendorId)
-                        .ownedBeaconPlistRaw(ownedBeaconPList);
+                        .secureLocationsSecret(secureLocationsSecret)
+                        .fromAccount(beaconData.getOwnedBeaconInfo().fromAccount)
+                        .ignoredAt(beaconData.getOwnedBeaconInfo().ignoredAt)
+                        .fruitlessScans(beaconData.getOwnedBeaconInfo().fruitlessScans)
+                        .lastScanAt(beaconData.getOwnedBeaconInfo().lastScanAt)
+                        .ownedBeaconPlistRaw(ownedBeaconPList)
+                        .ownedBeaconAccessoryJson(beaconData.getOwnedBeaconInfo().accessoryJson);
 
                 if (userOverrides != null) {
                     // configure user overrides too
                     extractedData.userOverrideName(userOverrides.uiName)
-                            .userOverrideEmoji(userOverrides.uiEmoji);
+                            .userOverrideEmoji(userOverrides.uiEmoji)
+                            .uiOrder(userOverrides.uiOrder);
                 }
 
                 res.add(extractedData.build());

@@ -15,17 +15,34 @@
             type="boolean" />
     </data>
 
+    <!--
+        Scrollable, because this screen is no longer a fixed height. Local Anisette failing
+        reveals the server field and its explanation, and on a shorter phone that pushes the
+        button below it off the bottom - which is worse here than anywhere else in the app,
+        since this screen is the only route to that setting for somebody who cannot sign in.
+        Caught by AppleLoginFallbackFlowTest, which passed on a tall emulator and failed on a
+        Pixel 6.
+
+        fillViewport so the content still fills the screen when it does fit, which is the
+        normal case; without it the layout collapses to its content height.
+    -->
+    <ScrollView
+        android:id="@+id/app_login_scroll"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:fillViewport="true">
+
     <LinearLayout
         android:id="@+id/app_login_container"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
+        android:layout_height="wrap_content"
         android:orientation="vertical"
         android:paddingTop="80dp">
 
 
         <LinearLayout
             android:layout_width="match_parent"
-            android:layout_height="match_parent"
+            android:layout_height="wrap_content"
             android:orientation="vertical">
 
             <LinearLayout
@@ -37,9 +54,9 @@
 
                 <ImageView
                     android:id="@+id/appLogo"
-                    android:layout_width="48dp"
-                    android:layout_height="48dp"
-                    app:srcCompat="@drawable/opentagviewer_icon" />
+                    android:layout_width="92dp"
+                    android:layout_height="92dp"
+                    app:srcCompat="@drawable/opentagviewer_icon_themed" />
 
                 <TextView
                     android:id="@+id/login_current_input_indicator"
@@ -49,7 +66,7 @@
                     android:fontFamily="@font/nunito_bold"
                     android:gravity="center"
                     android:text="@string/welcome"
-                    android:textColor="@color/md_theme_onSurface"
+                    android:textColor="?attr/colorOnSurface"
                     android:textSize="24sp" />
 
             </LinearLayout>
@@ -78,13 +95,13 @@
 
                     <Button
                         android:id="@+id/go_to_maininfo"
-                        style="?attr/materialIconButtonOutlinedStyle"
+                        style="?attr/materialIconButtonFilledTonalStyle"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:enabled="@{allowServerConfNext}"
                         android:onClick="onClickToLoginAccount"
                         app:icon="@drawable/arrow_forward_24px"
-                        app:iconTint="@color/md_theme_onSurfaceVariant_mediumContrast" />
+                        app:iconTint="?attr/colorOnSecondaryContainer" />
 
                 </LinearLayout>
 
@@ -103,27 +120,81 @@
                 android:visibility="gone"
                 tools:visibility="gone">
 
+                <!--
+                    **`gone` until something fails, never `invisible`.** An invisible view still
+                    takes its full height, so the empty box sat between the title and the fields
+                    as a blank band - and grew when the Export logs button went inside it. The code
+                    only ever sets VISIBLE on a failure and GONE on success, so gone is also the
+                    state it was always meant to start in.
+                -->
                 <FrameLayout
                     android:id="@+id/login_error_container"
                     android:layout_width="match_parent"
-                    android:layout_height="match_parent"
+                    android:layout_height="wrap_content"
                     android:layout_marginTop="8dp"
                     android:layout_marginBottom="8dp"
                     android:background="@drawable/layout_rounded_less"
-                    android:backgroundTint="@color/md_theme_errorContainer"
-                    android:visibility="invisible"
+                    android:backgroundTint="?attr/colorErrorContainer"
+                    android:visibility="gone"
                     tools:visibility="visible">
 
-                    <TextView
-                        android:id="@+id/login_error_message_text"
+                    <LinearLayout
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:fontFamily="@font/nunito_medium"
-                        android:padding="8dp"
-                        android:text="@string/login_failed_x"
-                        android:textColor="@color/md_theme_onErrorContainer"
-                        android:textSize="14sp"
-                        tools:visibility="visible" />
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:id="@+id/login_error_message_text"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:fontFamily="@font/nunito_medium"
+                            android:padding="8dp"
+                            android:text="@string/login_failed_x"
+                            android:textColor="?attr/colorOnErrorContainer"
+                            android:textSize="14sp"
+                            tools:visibility="visible" />
+
+                        <!--
+                            **The only way off this screen with a log in hand.** A sign-in failure
+                            never reached the error report page, so the one screen whose failures
+                            need diagnosing was the one screen that could not produce evidence -
+                            short of adb on a second machine. Opens the report page as its own
+                            activity, so closing it comes straight back here with the error still
+                            showing.
+                        -->
+                        <!--
+                            Shown only when Apple refused the sign-in itself (a 429 or 503),
+                            never for a wrong password. Local Anisette works on this device and
+                            Apple still said no, so the one thing left to try is signing in
+                            through a server, which presents a different machine identity. The
+                            server field is otherwise unreachable here - Settings is behind the
+                            login this cannot get past. `gone` until that specific failure.
+                        -->
+                        <Button
+                            android:id="@+id/login_error_try_remote_anisette"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_gravity="end"
+                            android:layout_marginEnd="8dp"
+                            android:text="@string/login_try_remote_anisette"
+                            android:textColor="?attr/colorOnErrorContainer"
+                            android:visibility="gone"
+                            app:strokeColor="?attr/colorOnErrorContainer"
+                            tools:visibility="visible" />
+
+                        <Button
+                            android:id="@+id/login_error_export_logs"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_gravity="end"
+                            android:layout_marginEnd="8dp"
+                            android:layout_marginBottom="8dp"
+                            android:text="@string/login_export_logs"
+                            android:textColor="?attr/colorOnErrorContainer"
+                            app:strokeColor="?attr/colorOnErrorContainer" />
+                    </LinearLayout>
                 </FrameLayout>
 
                 <com.google.android.material.textfield.TextInputLayout
@@ -170,13 +241,13 @@
 
                     <Button
                         android:id="@+id/iconButton2"
-                        style="?attr/materialIconButtonOutlinedStyle"
+                        style="?attr/materialIconButtonFilledTonalStyle"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_weight="0"
                         android:onClick="onClickBackToAnisetteSettings"
                         app:icon="@drawable/arrow_back_24px"
-                        app:iconTint="@color/md_theme_onSurfaceVariant_mediumContrast" />
+                        app:iconTint="?attr/colorOnSecondaryContainer" />
 
                     <LinearLayout
                         android:layout_width="match_parent"
@@ -202,6 +273,13 @@
                 </LinearLayout>
 
             </LinearLayout>
+
+            <!--
+              Apple's terms of service. Its own file so it can be inflated without this
+              one, which pulls in the settings panel and cannot inflate outside an
+              activity - see TermsStepLayoutTest.
+            -->
+            <include layout="@layout/login_terms_step" />
 
             <LinearLayout
                 android:id="@+id/login_2fa_choice"
@@ -229,7 +307,7 @@
 
                     <Button
                         android:id="@+id/twofactorauth_choice_trusted_device"
-                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        style="@style/Widget.Material3.Button.TonalButton"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="5dp"
@@ -239,11 +317,11 @@
                         android:paddingTop="12dp"
                         android:paddingBottom="12dp"
                         android:text="@string/auth_by_trusted_device"
-                        android:textColor="@color/md_theme_onSurfaceVariant_mediumContrast"
+                        android:textColor="?attr/colorOnSurfaceVariant"
                         android:textSize="18sp"
                         app:icon="@drawable/devices_24px"
                         app:iconSize="24dp"
-                        app:iconTint="@color/md_theme_onSurfaceVariant_mediumContrast" />
+                        app:iconTint="?attr/colorOnSecondaryContainer" />
                 </LinearLayout>
 
                 <LinearLayout
@@ -258,12 +336,12 @@
 
                     <Button
                         android:id="@+id/twofactorauth_option_selection_back_to_login"
-                        style="?attr/materialIconButtonOutlinedStyle"
+                        style="?attr/materialIconButtonFilledTonalStyle"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:onClick="onClickBackToLogin"
                         app:icon="@drawable/arrow_back_24px"
-                        app:iconTint="@color/md_theme_onSurfaceVariant_mediumContrast" />
+                        app:iconTint="?attr/colorOnSecondaryContainer" />
 
                 </LinearLayout>
 
@@ -280,132 +358,7 @@
                 tools:visibility="visible">
 
 
-                <LinearLayout
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:orientation="horizontal">
-
-                    <com.google.android.material.textfield.TextInputLayout
-                        android:id="@+id/twofactorauth_textinput_container_1"
-                        style="?attr/textInputOutlinedDenseStyle"
-                        android:layout_width="44dp"
-                        android:layout_height="wrap_content"
-                        android:layout_marginLeft="5dp"
-                        android:layout_marginRight="5dp">
-
-                        <com.google.android.material.textfield.TextInputEditText
-                            android:id="@+id/twofactorauth_textinput_1"
-                            android:layout_width="match_parent"
-                            android:layout_height="42dp"
-                            android:gravity="center"
-                            android:inputType="number"
-                            android:padding="10dp"
-                            android:singleLine="true"
-                            android:textSize="16sp" />
-
-                    </com.google.android.material.textfield.TextInputLayout>
-
-                    <com.google.android.material.textfield.TextInputLayout
-                        android:id="@+id/twofactorauth_textinput_container_2"
-                        style="?attr/textInputOutlinedDenseStyle"
-                        android:layout_width="44dp"
-                        android:layout_height="wrap_content"
-                        android:layout_marginLeft="5dp"
-                        android:layout_marginRight="5dp">
-
-                        <com.google.android.material.textfield.TextInputEditText
-                            android:id="@+id/twofactorauth_textinput_2"
-                            android:layout_width="match_parent"
-                            android:layout_height="42dp"
-                            android:gravity="center"
-                            android:inputType="number"
-                            android:padding="10dp"
-                            android:singleLine="true"
-                            android:textSize="16sp" />
-
-                    </com.google.android.material.textfield.TextInputLayout>
-
-                    <com.google.android.material.textfield.TextInputLayout
-                        android:id="@+id/twofactorauth_textinput_container_3"
-                        style="?attr/textInputOutlinedDenseStyle"
-                        android:layout_width="44dp"
-                        android:layout_height="wrap_content"
-                        android:layout_marginLeft="5dp"
-                        android:layout_marginRight="5dp">
-
-                        <com.google.android.material.textfield.TextInputEditText
-                            android:id="@+id/twofactorauth_textinput_3"
-                            android:layout_width="match_parent"
-                            android:layout_height="42dp"
-                            android:gravity="center"
-                            android:inputType="number"
-                            android:padding="10dp"
-                            android:singleLine="true"
-                            android:textSize="16sp" />
-
-                    </com.google.android.material.textfield.TextInputLayout>
-
-                    <com.google.android.material.textfield.TextInputLayout
-                        android:id="@+id/twofactorauth_textinput_container_4"
-                        style="?attr/textInputOutlinedDenseStyle"
-                        android:layout_width="44dp"
-                        android:layout_height="wrap_content"
-                        android:layout_marginLeft="5dp"
-                        android:layout_marginRight="5dp">
-
-                        <com.google.android.material.textfield.TextInputEditText
-                            android:id="@+id/twofactorauth_textinput_4"
-                            android:layout_width="match_parent"
-                            android:layout_height="42dp"
-                            android:gravity="center"
-                            android:inputType="number"
-                            android:padding="10dp"
-                            android:singleLine="true"
-                            android:textSize="16sp" />
-
-                    </com.google.android.material.textfield.TextInputLayout>
-
-                    <com.google.android.material.textfield.TextInputLayout
-                        android:id="@+id/twofactorauth_textinput_container_5"
-                        style="?attr/textInputOutlinedDenseStyle"
-                        android:layout_width="44dp"
-                        android:layout_height="wrap_content"
-                        android:layout_marginLeft="5dp"
-                        android:layout_marginRight="5dp">
-
-                        <com.google.android.material.textfield.TextInputEditText
-                            android:id="@+id/twofactorauth_textinput_5"
-                            android:layout_width="match_parent"
-                            android:layout_height="42dp"
-                            android:gravity="center"
-                            android:inputType="number"
-                            android:padding="10dp"
-                            android:singleLine="true"
-                            android:textSize="16sp" />
-
-                    </com.google.android.material.textfield.TextInputLayout>
-
-                    <com.google.android.material.textfield.TextInputLayout
-                        android:id="@+id/twofactorauth_textinput_container_6"
-                        style="?attr/textInputOutlinedDenseStyle"
-                        android:layout_width="44dp"
-                        android:layout_height="wrap_content"
-                        android:layout_marginLeft="5dp"
-                        android:layout_marginRight="5dp">
-
-                        <com.google.android.material.textfield.TextInputEditText
-                            android:id="@+id/twofactorauth_textinput_6"
-                            android:layout_width="match_parent"
-                            android:layout_height="42dp"
-                            android:gravity="center"
-                            android:inputType="number"
-                            android:padding="10dp"
-                            android:singleLine="true"
-                            android:textSize="16sp" />
-
-                    </com.google.android.material.textfield.TextInputLayout>
-
-                </LinearLayout>
+                <include layout="@layout/two_factor_code_row" />
 
                 <TextView
                     android:id="@+id/twofa_sent_info_text"
@@ -421,7 +374,7 @@
                     android:layout_height="match_parent"
                     android:layout_margin="8dp"
                     android:background="@drawable/layout_rounded_less"
-                    android:backgroundTint="@color/md_theme_errorContainer"
+                    android:backgroundTint="?attr/colorErrorContainer"
                     android:visibility="invisible"
                     tools:visibility="visible">
 
@@ -432,7 +385,7 @@
                         android:fontFamily="@font/nunito_medium"
                         android:padding="8dp"
                         android:text="@string/twofactor_failed_x"
-                        android:textColor="@color/md_theme_onErrorContainer"
+                        android:textColor="?attr/colorOnErrorContainer"
                         android:textSize="14sp" />
                 </FrameLayout>
 
@@ -447,12 +400,12 @@
 
                     <Button
                         android:id="@+id/twofactorauthchoice_back_button"
-                        style="?attr/materialIconButtonOutlinedStyle"
+                        style="?attr/materialIconButtonFilledTonalStyle"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:onClick="onClickBackTo2FAMethodChoice"
                         app:icon="@drawable/arrow_back_24px"
-                        app:iconTint="@color/md_theme_onSurfaceVariant_mediumContrast" />
+                        app:iconTint="?attr/colorOnSecondaryContainer" />
 
                 </LinearLayout>
 
@@ -476,7 +429,7 @@
                     android:indeterminate="true"
                     app:hideAnimationBehavior="inward"
                     app:showAnimationBehavior="inward"
-                    app:trackColor="@color/md_theme_surfaceVariant_highContrast"
+                    app:trackColor="?attr/colorSurfaceVariant"
                     app:trackCornerRadius="2dp" />
 
                 <TextView
@@ -493,4 +446,6 @@
         </LinearLayout>
 
     </LinearLayout>
+
+    </ScrollView>
 </layout>

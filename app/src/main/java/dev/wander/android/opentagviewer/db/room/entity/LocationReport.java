@@ -26,7 +26,17 @@ import lombok.Builder;
                         onDelete = ForeignKey.CASCADE
                 )
         },
-        indices = @Index(value = {"hash_id", "beacon_id", "timestamp"})
+        // **`beacon_id` leads, and that is the whole point.** SQLite only uses an index for a
+        // foreign-key check when the referencing column is leftmost, so the old
+        // `{hash_id, beacon_id, timestamp}` served the key not at all - every change to
+        // OwnedBeacons scanned this table, which holds every position ever recorded for every
+        // tag. Room says so on every build.
+        //
+        // It served the queries no better. `hash_id` is the primary key, so leading with it
+        // duplicated an index SQLite maintains anyway, while every query in LocationReportDao
+        // filters on `beacon_id` and most then order by `timestamp` - none of which that index
+        // could answer.
+        indices = @Index(value = {"beacon_id", "timestamp"})
 )
 public class LocationReport {
     /**
@@ -69,4 +79,40 @@ public class LocationReport {
 
     @ColumnInfo(name = "last_update")
     public long lastUpdate;
+
+    /**
+     * Where this report came from: {@code apple} or {@code local}.
+     *
+     * <p><b>An Apple report and a locally heard sighting are the same shape and not the same
+     * claim.</b> An Apple row says some stranger's iPhone overheard the tag and reported a
+     * position it worked out for itself, typically to within a hundred metres or worse. A local
+     * row says this phone heard the tag directly, which puts it inside Bluetooth range - tens of
+     * metres - and records the phone's own position as the tag's.
+     *
+     * <p>Both belong in this table, because everything that draws a tag reads from here: the map
+     * marker, the "last updated" line, the navigate button and the history. A separate table
+     * would mean teaching all of them about a second source.
+     *
+     * <p><b>The column exists because the history is exported.</b> Without it the CSV hands
+     * somebody a file where their own phone's positions sit unlabelled among Apple's, and
+     * nothing in the file says which is which.
+     *
+     * <p>Defaults to {@code apple}, which is correct for every row written before this existed:
+     * they all came from the network.
+     */
+    @NonNull
+    @ColumnInfo(name = "provenance", defaultValue = PROVENANCE_APPLE)
+    public String provenance;
+
+    /** Decrypted from Apple's Find My network. */
+    public static final String PROVENANCE_APPLE = "apple";
+
+    /** Heard by this phone's own radio, positioned from this phone's own location. */
+    public static final String PROVENANCE_LOCAL = "local";
+
+    /**
+     * Reported by the Google Find Hub network, through the googlefind service
+     * (see {@code source/ExtraSourcesApi}).
+     */
+    public static final String PROVENANCE_GOOGLE = "google";
 }

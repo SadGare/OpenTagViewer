@@ -22,7 +22,7 @@
                 android:layout_height="wrap_content"
                 android:fontFamily="@font/nunito_bold"
                 android:text="@string/language"
-                android:textColor="@color/md_theme_outlineVariant_mediumContrast" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
         </LinearLayout>
 
         <include layout="@layout/language_input" />
@@ -43,7 +43,7 @@
                 android:layout_height="wrap_content"
                 android:fontFamily="@font/nunito_bold"
                 android:text="@string/map_provider"
-                android:textColor="@color/md_theme_outlineVariant_mediumContrast" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
         </LinearLayout>
 
         <include layout="@layout/map_provider_input" />
@@ -52,9 +52,162 @@
             android:layout_width="match_parent"
             android:layout_height="20dp" />
 
+        <!--
+            The Anisette server, which signing in no longer normally needs: Anisette is
+            produced on the device itself, and this screen is quieter for it.
+
+            Hidden rather than deleted, and revealed by AppleLoginActivity when local Anisette
+            cannot set itself up. Somebody signing in for the first time on a device where that
+            fails has no other way to reach this setting - Settings is behind a login - so
+            removing it outright would strand exactly the people who need it.
+        -->
+        <LinearLayout
+            android:id="@+id/anisetteRemoteSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+        <!--
+            Why this section came back, for somebody who never asked to see it. Without a
+            reason attached, a server URL appearing out of nowhere on the sign-in screen reads
+            as the app being broken rather than as it working around something.
+        -->
+        <TextView
+            android:id="@+id/anisetteLoginFallbackReason"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:text="@string/anisette_login_needs_server"
+            android:textColor="?attr/colorOutline"
+            android:textSize="13sp"
+            android:visibility="gone" />
+
+        <!--
+            Only when Apple's library crashes on this phone (issue #232). Nothing in Settings fixes
+            that and the cause is not known, so which phone it is is the useful thing to send.
+        -->
+        <Button
+            android:id="@+id/anisetteReportCrashButton"
+            style="?attr/materialButtonOutlinedStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:text="@string/anisette_report_crash"
+            android:visibility="gone" />
+
+        <!--
+            Only when the emulated Mac could not get Apple's macOS CoreADI. The server below
+            would sign in and then fail every location fetch, so what is offered first is the
+            file itself: Apple's link to copy, and a way to choose the download once it is on
+            the phone. See AnisetteStatus.State.NEEDS_COREADI.
+        -->
+        <!--
+            A card, like the iCloud link page's status card: the explanation, the link and the
+            buttons read as one thing to deal with rather than as more of the form around them.
+            The explanation is inside it; the loose fallback reason above is hidden for this case.
+        -->
+        <LinearLayout
+            android:id="@+id/anisetteCoreAdiContainer"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/layout_rounded"
+            android:backgroundTint="?attr/colorSurfaceContainerLow"
+            android:orientation="vertical"
+            android:paddingLeft="16dp"
+            android:paddingTop="16dp"
+            android:paddingRight="16dp"
+            android:paddingBottom="12dp"
+            android:visibility="gone">
+
+            <!-- The icon beside the title only; everything under it uses the full width. -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <ImageView
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:importantForAccessibility="no"
+                    android:id="@+id/anisetteCoreAdiIcon"
+                    app:srcCompat="@drawable/warning_24px_fill"
+                    app:tint="?attr/colorError" />
+
+                <TextView
+                    android:id="@+id/anisetteCoreAdiTitle"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="12dp"
+                    android:layout_weight="1"
+                    android:fontFamily="@font/nunito_semi_bold"
+                    android:text="@string/anisette_coreadi_card_title"
+                    android:textColor="?attr/colorOnSurface"
+                    android:textSize="16sp" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/anisetteCoreAdiExplanation"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/anisette_login_needs_coreadi"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/anisetteCoreAdiLink"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:fontFamily="monospace"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:textIsSelectable="true"
+                android:textSize="11sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/anisetteCopyCoreAdiLinkButton"
+                style="?attr/borderlessButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="-12dp"
+                android:text="@string/anisette_coreadi_copy_link" />
+
+            <TextView
+                android:id="@+id/anisetteCoreAdiRejection"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="4dp"
+                android:textColor="?attr/colorError"
+                android:textSize="13sp"
+                android:visibility="gone" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/anisetteChooseCoreAdiButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="8dp"
+                    android:text="@string/anisette_choose_apk" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/anisetteRetryCoreAdiButton"
+                    style="?attr/materialButtonOutlinedStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/retry" />
+            </LinearLayout>
+        </LinearLayout>
+
         <LinearLayout
             android:layout_width="match_parent"
-            android:layout_height="match_parent"
+            android:layout_height="wrap_content"
             android:orientation="horizontal"
             android:gravity="center_vertical"
             >
@@ -65,7 +218,7 @@
                 android:layout_height="wrap_content"
                 android:fontFamily="@font/nunito_bold"
                 android:text="@string/anisette_server_url"
-                android:textColor="@color/md_theme_outlineVariant_mediumContrast" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
 
             <LinearLayout
                 android:layout_width="wrap_content"
@@ -81,7 +234,7 @@
                     android:layout_weight="0"
                     android:visibility="gone"
                     app:srcCompat="@drawable/check_circle_24px_fill"
-                    app:tint="@color/md_theme_outline" />
+                    app:tint="?attr/colorOutline" />
 
                 <ImageView
                     android:id="@+id/anisetteServerUrlErrorIcon"
@@ -90,7 +243,7 @@
                     android:layout_weight="0"
                     android:visibility="gone"
                     app:srcCompat="@drawable/warning_24px_fill"
-                    app:tint="@color/md_theme_error" />
+                    app:tint="?attr/colorError" />
 
                 <com.google.android.material.progressindicator.CircularProgressIndicator
                     android:id="@+id/anisetteServerUrlProgressIndicator"
@@ -100,7 +253,7 @@
                     app:hideAnimationBehavior="inward"
                     app:indicatorSize="21dp"
                     app:showAnimationBehavior="inward"
-                    app:trackColor="@color/md_theme_surfaceVariant_highContrast"
+                    app:trackColor="?attr/colorSurfaceVariant"
                     app:trackCornerRadius="2dp"
                     />
 
@@ -110,6 +263,8 @@
         </LinearLayout>
 
         <include layout="@layout/anisette_server_url_input" />
+
+        </LinearLayout>
 
     </LinearLayout>
 

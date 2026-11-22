@@ -2,6 +2,7 @@ package dev.wander.android.opentagviewer.data.model;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.regex.Pattern;
 
 import lombok.Builder;
 import lombok.Getter;
@@ -15,6 +16,15 @@ public class BeaconInformation {
     private static final String IPAD = "iPad";
 
     private static final int AIRTAG_PRODUCT_ID = 21760;
+
+    /**
+     * The {@code <family><major>,<minor>} shape Apple's own hardware uses and accessories do
+     * not - {@code iPad13,18}, {@code MacBookAir10,1}.
+     *
+     * <p>Kept character-for-character in step with {@code _APPLE_MODEL} in
+     * {@code opentagviewer_export/hardware.py}. See {@link #isOwnDevice()}.
+     */
+    private static final Pattern APPLE_MODEL = Pattern.compile("^[A-Za-z]+\\d+,\\d+$");
 
     /**
      * Beacon id. This is present in both {@code .plist} files,
@@ -70,6 +80,15 @@ public class BeaconInformation {
      * Sourced from the primary file: {@code OwnedBeacons/<beacon identifier>.plist}
      */
     private final String ownedBeaconPlistRaw;
+    /**
+     * Serialized FindMyAccessory/FixedRollingKeyPairAccessory state (JSON) - see
+     * {@code OwnedBeacon.accessoryJson}. Null for a row imported under FindMy 0.7.6 that has not
+     * yet been backfilled from {@link #ownedBeaconPlistRaw}.
+     *
+     * <p>What {@code dev.wander.android.opentagviewer.ble} resolves a current BLE MAC address
+     * from, to recognise this accessory's own advertisement in a scan.
+     */
+    private final String ownedBeaconAccessoryJson;
     /**
      * {@code 0} or {@code 1} (?)
      * <br><br>
@@ -170,6 +189,16 @@ public class BeaconInformation {
     @Setter
     private String userOverrideEmoji;
 
+    /**
+     * Where the user dragged this tag to on the device list, or null if they never have.
+     *
+     * <p>An override like the two above, and stored beside them - see
+     * {@code UserBeaconOptions.uiOrder}. Read by {@link dev.wander.android.opentagviewer.util.TagOrder},
+     * where null means "unarranged" rather than "first".
+     */
+    @Setter
+    private Integer uiOrder;
+
 
     public String getName() {
         return Optional.ofNullable(this.userOverrideName).orElse(this.originalName);
@@ -193,9 +222,114 @@ public class BeaconInformation {
     }
 
     /**
+     * Whether this record carries {@code secureLocationsSharedSecret}.
+     *
+     * <p>The second of the two signals {@link #isOwnDevice()} reads. Only the presence of the
+     * node is kept, never the value: this is key material, and nothing in the app needs it -
+     * the question being asked is what kind of thing this is.
+     */
+    private final boolean secureLocationsSecret;
+
+    /**
+     * Whether this is one of the owner's own devices - an iPhone, iPad or Mac - rather than an
+     * accessory.
+     *
+     * <p><b>The same two signals as {@code opentagviewer_export.hardware.is_own_device}, and
+     * they have to stay the same two.</b> That function is the shared one, used by both desktop
+     * exporters and reachable from here over the bridge - but it costs a Python call and
+     * answers asynchronously, which is no use to a list being bound or a fetch batch being
+     * assembled. So this is a second implementation of one rule, which is a thing that drifts;
+     * {@code OwnDeviceMatchesThePythonRuleTest} runs both over the same fixtures for that
+     * reason.
+     *
+     * <ul>
+     *   <li><b>An Apple model identifier</b> in {@code model} - {@code iPad13,18},
+     *       {@code MacBookPro18,3}. An accessory leaves {@code model} empty and says what it is
+     *       through {@code productId} and {@code vendorId} instead.</li>
+     *   <li><b>{@link #secureLocationsSecret}</b>, which an iPhone, iPad or Mac carries in place
+     *       of the {@code secondarySharedSecret} an accessory carries. See findmy-export
+     *       06-output section 2.3.</li>
+     * </ul>
+     *
+     * <p><b>Unsure means accessory, and that direction is deliberate.</b> This decides whether a
+     * tag is hidden and whether it is searched for at all, so a false positive is a tag that
+     * silently stops being located - no error, no empty state, just a row that never updates
+     * and no way to tell why. A false negative is an iPad in the list, which is merely the
+     * behaviour of every version before this one.
+     *
+     * <p>AirPods are deliberately not caught, matching the Python: their model lives inside
+     * {@code stableIdentifier} rather than in {@code model}, and they are an accessory somebody
+     * bought rather than the computer they work on.
+     */
+    public boolean isOwnDevice() {
+        if (this.model != null && APPLE_MODEL.matcher(this.model).matches()) {
+            return true;
+        }
+        return this.secureLocationsSecret;
+    }
+
+    /**
      * Disclaimer: not clear if this is exhaustive enough of a check
      */
     public boolean isAirTag() {
         return this.productId == AIRTAG_PRODUCT_ID;
+    }
+
+    /**
+     * Whether this tag was generated rather than paired - OpenHaystack-style.
+     *
+     * <p>Set at construction rather than inferred, unlike {@link #isAirTag()} and
+     * {@link #isIpad()}, which guess from a plist field. There is nothing to guess from here:
+     * a self-generated tag has no plist, no product id and no vendor id, so every heuristic on
+     * this class returns false for it and would go on saying "Unknown" forever.
+     */
+    private final boolean customAccessory;
+
+    /**
+     * How many pre-generated keys it carries, or 0 if that could not be read.
+     *
+     * <p>Shown because it is the one number that says something real about this kind of tag:
+     * the keys are a finite list rather than a rolling derivation, so it will stop being
+     * findable once they run out. An Apple-paired tag has no equivalent.
+     */
+    private final int customAccessoryKeyCount;
+
+    /**
+     * Whether this tag is a cache of the user's Apple account rather than the app's own copy.
+     *
+     * <p><b>It decides whether the app may remove it.</b> A file-imported tag exists only here,
+     * so removing it is the user's decision and nobody else's. An account tag is a copy of what
+     * Apple holds, and the next refresh rewrites the row from the account - so "remove" would
+     * appear to work and then quietly undo itself. Removing one for real means removing it in
+     * Find My, which this app deliberately does not do on the user's behalf.
+     *
+     * <p>Set at construction from {@code OwnedBeacon.fromAccount}, like {@link #isCustomAccessory()}
+     * and unlike the heuristics on this class - there is nothing in a plist to infer it from.
+     */
+    private final boolean fromAccount;
+
+    /**
+     * When the app gave up looking for this tag, or null if it has not.
+     *
+     * <p>Set only after a search covering months of history found nothing anywhere - not merely
+     * after an empty search, which for a recently paired tag means very little. Shown on the
+     * device list in place of "no last location known", because those two states look identical
+     * and are not: one is a tag nobody has walked past this week, the other is a tag that has
+     * stopped broadcasting and is no longer being looked for.
+     */
+    private final Long ignoredAt;
+
+    /** Consecutive searches that found nothing, which is what paces the next one. */
+    private final int fruitlessScans;
+
+    /** When it was last searched for, or null if never. */
+    private final Long lastScanAt;
+
+    public boolean isIgnored() {
+        return this.ignoredAt != null;
+    }
+
+    public boolean isCustomAccessory() {
+        return this.customAccessory;
     }
 }

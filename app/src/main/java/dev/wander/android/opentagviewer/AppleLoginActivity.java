@@ -11,8 +11,11 @@ import static dev.wander.android.opentagviewer.ui.settings.SharedMainSettingsMan
 import static dev.wander.android.opentagviewer.ui.settings.SharedMainSettingsManager.ANISETTE_TEST_STATUS.OK;
 import static dev.wander.android.opentagviewer.util.android.TextChangedWatcherFactory.justWatchOnChanged;
 
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -23,20 +26,30 @@ import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.activity.OnBackPressedCallback;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.app.AppCompatDelegate;
 import androidx.core.os.LocaleListCompat;
 import androidx.databinding.DataBindingUtil;
+
+import dev.wander.android.opentagviewer.ui.error.ErrorReportActivity;
+import dev.wander.android.opentagviewer.ui.compat.WindowPaddingUtil;
 import androidx.lifecycle.ViewModelProvider;
 
+import com.chaquo.python.PyObject;
+import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 import com.google.android.material.progressindicator.CircularProgressIndicator;
 import com.google.android.material.textfield.MaterialAutoCompleteTextView;
 import com.google.android.material.textfield.TextInputEditText;
 
+import java.io.InputStream;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.regex.Pattern;
@@ -48,33 +61,91 @@ import dev.wander.android.opentagviewer.db.datastore.UserSettingsDataStore;
 import dev.wander.android.opentagviewer.db.repo.UserAuthRepository;
 import dev.wander.android.opentagviewer.db.repo.UserSettingsRepository;
 import dev.wander.android.opentagviewer.db.repo.model.UserSettings;
+import dev.wander.android.opentagviewer.python.AppleAuthService;
+import dev.wander.android.opentagviewer.python.AppDependencies;
+import dev.wander.android.opentagviewer.python.PythonAccountLoginException;
 import dev.wander.android.opentagviewer.python.PythonAuthService;
 import dev.wander.android.opentagviewer.python.PythonAuthService.AuthMethodPhone;
 import dev.wander.android.opentagviewer.python.PythonAuthService.PythonAuthResponse;
+import dev.wander.android.opentagviewer.python.TermsDocument;
+import dev.wander.android.opentagviewer.anisette.AnisetteSource;
+import dev.wander.android.opentagviewer.anisette.AnisetteStatus;
+import dev.wander.android.opentagviewer.anisette.EmulatedMacAnisette;
+import dev.wander.android.opentagviewer.anisette.MacCoreAdiFetcher;
 import dev.wander.android.opentagviewer.service.web.AnisetteServerTesterService;
 import dev.wander.android.opentagviewer.service.web.CronetProvider;
 import dev.wander.android.opentagviewer.service.web.GitHubService;
 import dev.wander.android.opentagviewer.service.web.GithubRawUtilityFilesService;
 import dev.wander.android.opentagviewer.ui.login.Apple2FACodeInputManager;
+import dev.wander.android.opentagviewer.ui.login.StepTransition;
+import dev.wander.android.opentagviewer.ui.login.StepTransition.Direction;
+import dev.wander.android.opentagviewer.ui.settings.AmapApiKeyDialog;
 import dev.wander.android.opentagviewer.ui.settings.SharedMainSettingsManager;
+import dev.wander.android.opentagviewer.util.HowLongToWait;
 import dev.wander.android.opentagviewer.util.android.AppCryptographyUtil;
 import dev.wander.android.opentagviewer.util.android.PropertiesUtil;
+import dev.wander.android.opentagviewer.util.rx.ACodeAppleAlreadyTook;
 import dev.wander.android.opentagviewer.viewmodel.AppleLoginViewModel;
 import dev.wander.android.opentagviewer.viewmodel.LoginActivityState;
 import dev.wander.android.opentagviewer.viewmodel.LoginActivityState.PAGE;
 import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers;
 import io.reactivex.rxjava3.core.Observable;
+import io.reactivex.rxjava3.schedulers.Schedulers;
 import lombok.extern.slf4j.Slf4j;
 
 /**
  * This entire thing should be refactored and made less convoluted and spaghetti-like
- * Also: prettier (i.e. add animations)
  */
 @Slf4j
 public class AppleLoginActivity extends AppCompatActivity {
     private static final String TAG = AppleLoginActivity.class.getSimpleName();
 
     private static final Pattern REGEX_2FA_CODE = Pattern.compile("^[0-9]{6}$");
+
+    /**
+     * The mutually exclusive steps of the flow, in the order the user walks through them.
+     *
+     * <p>Listed once so that showing a step is "show this one" rather than every caller
+     * remembering to hide each of the others - which was six separate {@code setVisibility}
+     * calls spread over the file, and is the kind of thing that leaves two steps stacked on
+     * top of each other when one of them is missed.
+     */
+    private static final int[] PAGES = {
+            R.id.login_anisette_container,
+            R.id.login_maininfo_container,
+            R.id.login_2fa_choice,
+            R.id.login_2fa_container,
+            R.id.login_terms_container,
+    };
+
+    /**
+     * The half-signed-in account waiting on terms, and the documents it is waiting on.
+     *
+     * <p>Held on the activity rather than passed around because a {@code PyObject} cannot go in
+     * an {@code Intent} - which is also why this is a step of this screen and not a screen of
+     * its own. Cleared once signing in completes, so nothing outlives the flow that needed it.
+     */
+    private PyObject termsAccount = null;
+
+    private List<TermsDocument> termsDocuments = List.of();
+
+    private int termsIndex = 0;
+
+    /**
+     * Set when the user did not choose to be here - their stored session stopped working.
+     *
+     * <p>Worth distinguishing from an ordinary first run. Being dropped on a login screen with
+     * no explanation reads as the app having lost everything, and the reasonable response to
+     * that is to go and tidy up whatever unfamiliar entry is in your Apple device list - which
+     * is the one action that makes it worse.
+     */
+    public static final String EXTRA_SESSION_EXPIRED = "sessionExpired";
+
+    /**
+     * The address to put in the field, for somebody signing in again rather than for the first
+     * time. Only ever their own, read from the account being discarded.
+     */
+    public static final String EXTRA_PREFILL_EMAIL = "prefillEmail";
 
     private static final int HINT_DIFFERENT_ANISETTE_SERVER_AFTER_FAILED_2FACODES = 3;
 
@@ -95,6 +166,34 @@ public class AppleLoginActivity extends AppCompatActivity {
     private ActivityAppleLoginBinding binding;
 
     private Apple2FACodeInputManager twoFactorEntryManager;
+
+    /**
+     * Anisette produced here, which is what a sign-in normally uses.
+     *
+     * <p>A field rather than a local, so that the screen asks the same object every time and
+     * so that a test can put something else in its place - the states this screen has to
+     * handle otherwise require Apple to have shipped a new build, or the network to be down.
+     */
+    private AnisetteSource localAnisette;
+
+    /** Signing in to Apple. Behind an interface so a test can drive this screen at all. */
+    private AppleAuthService authService;
+
+    /**
+     * What it last said. Starts as "nothing tried yet", which is the only honest thing to say
+     * before the first check and is rendered as such.
+     */
+    private AnisetteStatus localAnisetteStatus = AnisetteStatus.pending();
+
+    /**
+     * Set when the user, after Apple refused a sign-in, asked to try a remote Anisette server.
+     *
+     * <p>Forces the server field visible on the setup step even though local Anisette is working,
+     * and tells {@link #onClickToLoginAccount} to persist remote mode and rebuild the Anisette
+     * source when they go on - so the next attempt actually goes through the server rather than
+     * the cached local ADI. Cleared once that switch is made.
+     */
+    private boolean forceAnisetteServerField = false;
 
     private TextInputEditText emailOrPhoneInput;
 
@@ -144,11 +243,21 @@ public class AppleLoginActivity extends AppCompatActivity {
                 this::onAnisetteUrlInputTyped
         );
 
-        this.anisetteServerTesterService = new AnisetteServerTesterService(cronet);
+        this.anisetteServerTesterService = AppDependencies.serverTester(cronet);
+
+        this.authService = AppDependencies.authService();
+
+        // Nobody is signed in on this screen, so an unchosen mode means local: there is no
+        // existing session whose machine identity has to be preserved.
+        this.localAnisette = AppDependencies.anisette(this, this.getUserSettings(), false);
 
         this.twoFactorEntryManager = new Apple2FACodeInputManager(this, this::on2FAAuthCodeFilled);
 
         this.binding = DataBindingUtil.setContentView(this, R.layout.activity_apple_login);
+        // This screen had neither inset applied - so its buttons sat under the navigation bar
+        // and its heading under the status bar, on the very first screen anybody sees. And the
+        // keyboard: it covered the Anisette server field while somebody was typing into it.
+        WindowPaddingUtil.insetForSystemBarsAndKeyboard(this.binding.getRoot());
 
         if (this.getSupportActionBar() != null) {
             this.getSupportActionBar().hide();
@@ -175,6 +284,90 @@ public class AppleLoginActivity extends AppCompatActivity {
         this.passwordInput = this.findViewById(R.id.password_input_field);
         this.loginButton = this.findViewById(R.id.login_button_main);
         this.twoFactorAuthChoiceBackButton = this.findViewById(R.id.twofactorauthchoice_back_button);
+
+        this.findViewById(R.id.login_error_export_logs)
+                .setOnClickListener(v -> this.openTheReportPageForTheLoginFailure());
+        this.findViewById(R.id.login_error_try_remote_anisette)
+                .setOnClickListener(v -> this.onClickTryRemoteAnisette());
+
+        // Supplying CoreADI by hand, offered only in AnisetteStatus.State.NEEDS_COREADI.
+        // Not the DMG's mime type: a download arrives as octet-stream, x-apple-diskimage or
+        // nothing at all, and filtering would hide the very file the user was sent to fetch.
+        this.findViewById(R.id.anisetteChooseCoreAdiButton)
+                .setOnClickListener(v -> this.pickCoreAdiLauncher.launch(new String[] {"*/*"}));
+        this.findViewById(R.id.anisetteRetryCoreAdiButton)
+                .setOnClickListener(v -> this.checkAnisetteAgain());
+        this.findViewById(R.id.anisetteCopyCoreAdiLinkButton)
+                .setOnClickListener(v -> this.copyCoreAdiLink());
+
+        this.findViewById(R.id.login_terms_agree_button)
+                .setOnClickListener(v -> this.onAgreeToTerms());
+
+        // **The terms box has to win the drag, or the contract cannot be read.**
+        //
+        // This whole screen is inside a vertical ScrollView, and the box holding the document is
+        // another one nested in it. Two vertical scrollers on top of each other means the outer
+        // one takes the gesture: dragging inside the document scrolls the *page*, and the
+        // document itself never moves - so everything past the first boxful is unreachable, on a
+        // screen whose entire purpose is reading to the end.
+        //
+        // Asking the parent not to intercept while a touch is inside the box is the standard fix
+        // and the smallest one. Returning false leaves the ScrollView to do its own scrolling.
+        //
+        // **There were two causes and this is only one of them.** The document TextView also had
+        // `textIsSelectable`, which makes it take the drag for a text-selection gesture, and the
+        // box did not scroll with that set either. Both had to go; removing either one on its own
+        // brings the bug back, which AcceptingTermsFlowTest was used to confirm in both
+        // directions. So selectable text cannot come back here without a scrolling story.
+        this.findViewById(R.id.login_terms_scroll).setOnTouchListener((view, event) -> {
+            view.getParent().requestDisallowInterceptTouchEvent(true);
+            return false;
+        });
+        // Leaving without agreeing. Nothing was sent, and the account is dropped rather than
+        // kept around half-signed-in - the next attempt starts a fresh one.
+        this.findViewById(R.id.login_terms_back_button).setOnClickListener(v -> {
+            this.termsAccount = null;
+            this.termsDocuments = List.of();
+            this.showPage(R.id.login_maininfo_container, Direction.BACK);
+            this.setCurrentStepText(R.string.apple_account, Direction.BACK);
+        });
+
+        this.explainWhySignedOutIfSent();
+    }
+
+    /**
+     * Somebody arriving here because their session stopped working, rather than by choice.
+     *
+     * <p>Being returned to a login screen with no explanation reads as the app having lost
+     * everything - which is exactly the moment somebody goes to their Apple device list, finds
+     * an entry they do not recognise, and removes it. So it says what happened, and says that
+     * the tags and their history are still here.
+     *
+     * <p>Shown on this screen rather than by whoever sent them, because this is the screen that
+     * stays: the sender is finishing, and a dialog on a finishing activity is a leaked window.
+     */
+    private void explainWhySignedOutIfSent() {
+        final String email = this.getIntent().getStringExtra(EXTRA_PREFILL_EMAIL);
+        if (email != null && !email.isEmpty()) {
+            // Prefilled whether or not the dialog is shown, and before it, so the field is
+            // already right the moment the dialog is dismissed rather than filling in
+            // afterwards in front of the user.
+            this.emailOrPhoneInput.setText(email);
+        }
+
+        if (!this.getIntent().getBooleanExtra(EXTRA_SESSION_EXPIRED, false)) {
+            return;
+        }
+
+        // Consumed, so that rotating the device - or coming back to this screen later - does
+        // not re-announce something the user has already read and acted on.
+        this.getIntent().removeExtra(EXTRA_SESSION_EXPIRED);
+
+        new MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.session_expired_title)
+                .setMessage(R.string.session_expired_message)
+                .setPositiveButton(R.string.ok, null)
+                .show();
     }
 
     @Override
@@ -223,9 +416,63 @@ public class AppleLoginActivity extends AppCompatActivity {
         }
     }
 
-    private void setCurrentStepText(final int stringResId) {
+    /**
+     * Move to one step of the flow, animating away whichever one is currently up.
+     *
+     * @param pageId    one of {@link #PAGES}, or {@link View#NO_ID} to leave the flow showing
+     *                  nothing - which is what happens while the spinner is up
+     * @param direction the way the user is travelling, which decides which way things slide.
+     *                  {@link Direction#NONE} for a render that is not navigation, such as
+     *                  the first draw or a restore after rotation
+     */
+    private void showPage(final int pageId, final Direction direction) {
+        View outgoing = null;
+        for (final int candidate : PAGES) {
+            if (candidate == pageId) {
+                continue;
+            }
+            final View page = this.findViewById(candidate);
+            if (outgoing == null && page.getVisibility() == VISIBLE) {
+                outgoing = page;
+                continue;
+            }
+            // Either already off screen or a second visible step, which should not happen.
+            // Hidden without ceremony either way: only one thing can animate out, and a view
+            // left half-faded by an earlier swap would come back that way next time.
+            StepTransition.swap(page, null, Direction.NONE);
+        }
+
+        StepTransition.swap(
+                outgoing,
+                pageId == View.NO_ID ? null : this.findViewById(pageId),
+                direction);
+    }
+
+    /** Leave the current step with nothing to replace it, because the spinner is taking over. */
+    private void hideCurrentPage(final Direction direction) {
+        this.showPage(View.NO_ID, direction);
+    }
+
+    /**
+     * Name the step the user is on, travelling with it when it changes.
+     *
+     * <p>Set before it is animated, so what it says is readable straight away and only the
+     * movement is decorative.
+     *
+     * <p>Unchanged text is left alone rather than re-animated. Choosing a 2FA method and then
+     * typing the code are two steps under one heading, so animating on every call would make
+     * the heading twitch for a change that did not happen.
+     */
+    private void setCurrentStepText(final int stringResId, final Direction direction) {
         TextView textView = this.findViewById(R.id.login_current_input_indicator);
-        textView.setText(stringResId);
+
+        final String next = this.getString(stringResId);
+        if (next.contentEquals(textView.getText())) {
+            return;
+        }
+
+        textView.setText(next);
+        StepTransition.enter(textView, direction);
     }
 
     private void showLoading(final Integer stringResId) {
@@ -257,32 +504,46 @@ public class AppleLoginActivity extends AppCompatActivity {
     }
 
     private void handleAuth(LoginActivityState state) {
-        this.setCurrentStepText(R.string.welcome);
+        this.setCurrentStepText(R.string.welcome, Direction.NONE);
         this.showLoading(null);
 
-        var sub = this.getAnisetteServerSetupStatus()
+        var sub = this.getAnisetteSetupStatus()
             .observeOn(AndroidSchedulers.mainThread())
             .subscribe(status -> {
                 this.hideLoading();
 
+                // Nothing here is navigation - it is the screen being drawn, or restored after
+                // a rotation. Animating it would replay steps the user did not just take.
                 if (status == SETUP_STATUS.OK && (!state.hasSpecifiedCurrentPage() || state.getCurrentPage() == PAGE.LOGIN)) {
                     this.binding.setAllowServerConfNext(true);
                     this.sharedMainSettingsManager.showAnisetteTestStatus(OK);
                     this.sharedMainSettingsManager.setAnisetteTextFieldError(null);
-                    this.showAccountLoginAuthOptions();
+                    this.showAccountLoginAuthOptions(Direction.NONE);
                 } else if (state.getCurrentPage() == PAGE.CHOOSE_2FA) {
-                    this.showNextAuthPage(state.getAuthResponse().getLoginState());
+                    this.showNextAuthPage(state.getAuthResponse().getLoginState(), Direction.NONE);
                 } else if (state.currentPageIs2faEntry()) {
-                    this.show2FACodeEntryTextbox();
+                    this.show2FACodeEntryTextbox(Direction.NONE);
                 } else {
                     // show welcome step/server setup step
-                    this.showInitialWelcomeConfOptions(status);
+                    this.showInitialWelcomeConfOptions(status, Direction.NONE);
                 }
             });
     }
 
     public void onClickToLoginAccount(View view) {
         Log.d(TAG, "Clicked onwards to account login!");
+
+        // When Anisette comes from this device the server field is not even on screen, so
+        // there is nothing to validate and nothing that could stop somebody getting past here.
+        // The exception is a user who asked for the server after Apple refused them: local is
+        // READY, but they are here to leave it, so they take the server path below instead.
+        if (this.localAnisetteStatus.state() == AnisetteStatus.State.READY
+                && !this.forceAnisetteServerField) {
+            this.getUiState().setCurrentPage(PAGE.LOGIN);
+            this.showAccountLoginAuthOptions(Direction.FORWARD);
+            return;
+        }
+
         MaterialAutoCompleteTextView urlTextInput = findViewById(R.id.anisetteServerUrl);
         final String currentInput = Optional.ofNullable(urlTextInput.getText())
                 .map(CharSequence::toString)
@@ -295,14 +556,23 @@ public class AppleLoginActivity extends AppCompatActivity {
         }
 
         this.testAndSaveAnisetteUrl(currentInput, () -> {
+            // A device forced here had working local Anisette, so unless the mode is switched the
+            // sign-in would go straight back to it - the cached ADI wins. Persisting remote and
+            // rebuilding the source is what makes the next attempt actually use the server.
+            if (this.forceAnisetteServerField) {
+                this.getUserSettings().setAnisetteMode(UserSettings.ANISETTE_REMOTE);
+                this.saveSettings();
+                this.localAnisette = AppDependencies.anisette(this, this.getUserSettings(), false);
+                this.forceAnisetteServerField = false;
+            }
             this.getUiState().setCurrentPage(PAGE.LOGIN);
-            this.showAccountLoginAuthOptions();
+            this.showAccountLoginAuthOptions(Direction.FORWARD);
         });
     }
 
     public void onClickBackToAnisetteSettings(View view) {
         Log.d(TAG, "Clicked backwards to language + anisette settings");
-        this.showInitialWelcomeConfOptions(SETUP_STATUS.NO_SERVER_CONFIGURED);
+        this.showInitialWelcomeConfOptions(SETUP_STATUS.NO_SERVER_CONFIGURED, Direction.BACK);
     }
 
     public void onClickLoginButton(View view) {
@@ -320,14 +590,18 @@ public class AppleLoginActivity extends AppCompatActivity {
         // show spinner in button
         // TODO: don't take away the entire UI like this.
         // for now this is good enough...
-        final LinearLayout accountLoginContainer = this.findViewById(R.id.login_maininfo_container);
-        accountLoginContainer.setVisibility(GONE);
+        this.hideCurrentPage(Direction.FORWARD);
 
         final String emailOrPhone = Objects.requireNonNull(emailOrPhoneInput.getText()).toString();
         final String password = Objects.requireNonNull(passwordInput.getText()).toString();
-        final String anisetteServerUrl = Objects.requireNonNull(this.getUserSettings().getAnisetteServerUrl());
+        final String anisetteServerUrl = this.getAnisetteServerUrlOrDefault();
 
-        var async = PythonAuthService.pythonLogin(emailOrPhone, password, anisetteServerUrl)
+        // Produces Anisette on this device when it can, so the login is not relayed through a
+        // public Anisette server. It decides for itself whether it is usable, and the Python
+        // side falls back to anisetteServerUrl when it is not - so this can only improve on
+        // the previous behaviour, never break it.
+        var async = this.authService.login(
+                    emailOrPhone, password, anisetteServerUrl, this.localAnisette)
             .observeOn(AndroidSchedulers.mainThread())
             .subscribe(authResponse -> {
                 Log.i(TAG, "Got logged in with response ");
@@ -341,19 +615,262 @@ public class AppleLoginActivity extends AppCompatActivity {
                 this.getUiState().setAuthResponse(null);
                 Log.e(TAG, "Error while trying to log in via python", error);
 
-                // undo loading and allow user to try again, basically.
-                this.hideLoading();
-                accountLoginContainer.setVisibility(VISIBLE);
-                emailOrPhoneInput.setEnabled(true);
-                passwordInput.setEnabled(true);
-                loginButton.setClickable(true);
+                // **Not the end of the attempt.** Authentication worked and the exchange after
+                // it did not, which is what an account with unaccepted terms does - and Apple
+                // takes agreement on one of its own devices or on iCloud.com, so this user
+                // generally has nowhere else to do it. Offered here rather than reported as a
+                // dead end. Falls back to the ordinary error if no documents come back, which
+                // is how "it was actually something else" is answered.
+                if (error instanceof PythonAccountLoginException
+                        && ((PythonAccountLoginException) error).hasTermsToAccept()) {
+                    this.handleTermsPending((PythonAccountLoginException) error);
+                    return;
+                }
 
-                FrameLayout loginErrorMessage = this.findViewById(R.id.login_error_container);
-                loginErrorMessage.setVisibility(VISIBLE);
-
-                TextView loginErrorText = this.findViewById(R.id.login_error_message_text);
-                loginErrorText.setText(this.getString(R.string.login_failed_x, error.getLocalizedMessage()));
+                // undo loading and allow user to try again, basically. Backwards, because
+                // that is what it is: the step the user just left, handed back to them.
+                //
+                // **Through showLoginFailure rather than inline.** This block did the same five
+                // things by hand, and the copy drifted the moment that method grew a sixth -
+                // recording the failure so the Export logs button can name it. The report opened
+                // saying `cause=unknown`, which reads as the button being broken rather than as
+                // one of two paths having been missed.
+                this.showLoginFailure(error);
             });
+    }
+
+    /**
+     * Fetch the terms Apple is waiting on and show the first of them.
+     *
+     * <p><b>Read-only.</b> Fetching records nothing; only {@link #onAgreeToTerms} writes, and
+     * only for a document the user has been shown.
+     *
+     * <p>An empty list is not an error and not a bug - it is how "the sign-in stopped for some
+     * other reason" is answered, since which failure means "terms pending" is not established.
+     * That falls through to the ordinary error, whose wording says exactly that.
+     */
+    private void handleTermsPending(final PythonAccountLoginException termsFailure) {
+        this.termsAccount = termsFailure.getAccount();
+        this.showLoading(R.string.terms_fetching);
+
+        var async = this.authService.pendingTerms(this.termsAccount)
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(documents -> {
+                    if (documents.isEmpty()) {
+                        Log.w(TAG, "Nothing was waiting on terms, so this was something else");
+                        this.showLoginFailure(termsFailure);
+                        return;
+                    }
+
+                    this.termsDocuments = documents;
+                    this.termsIndex = 0;
+                    this.showTermsStep(Direction.FORWARD);
+                }, error -> {
+                    Log.e(TAG, "Could not fetch the terms of service", error);
+                    this.showLoginFailure(termsFailure);
+                });
+    }
+
+    /** Put the document at {@link #termsIndex} on screen. */
+    private void showTermsStep(final Direction direction) {
+        final TermsDocument document = this.termsDocuments.get(this.termsIndex);
+
+        this.hideLoading();
+        this.setCurrentStepText(R.string.terms_title, direction);
+
+        final TextView counter = this.findViewById(R.id.login_terms_counter);
+        counter.setText(this.getString(R.string.terms_document_x_of_y,
+                this.termsIndex + 1, this.termsDocuments.size()));
+        // Hidden for a single document, where "Document 1 of 1" is noise on a screen that is
+        // already asking somebody to read a contract.
+        counter.setVisibility(this.termsDocuments.size() > 1 ? VISIBLE : GONE);
+
+        final TextView text = this.findViewById(R.id.login_terms_text);
+        text.setText(document.getText());
+        // Back to the top for each document. Otherwise the second one opens scrolled to wherever
+        // the first was left, which looks like part of it is missing.
+        ((ScrollView) this.findViewById(R.id.login_terms_scroll)).scrollTo(0, 0);
+
+        // A document Apple gave no agreement URL for cannot be accepted, and FindMy.py refuses
+        // to send one. Said plainly, with the button disabled rather than left to fail.
+        this.findViewById(R.id.login_terms_cannot_accept)
+                .setVisibility(document.isCanAccept() ? GONE : VISIBLE);
+        this.findViewById(R.id.login_terms_agree_button).setEnabled(document.isCanAccept());
+
+        this.showPage(R.id.login_terms_container, direction);
+    }
+
+    /**
+     * Record agreement to the document currently on screen, and move on.
+     *
+     * <p>Signing in is finished by the last one, and <b>only stored if it reached
+     * {@code LOGGED_IN}</b>. Anything else fails every later fetch inside FindMy.py's own state
+     * check, which is issues #43 and #119 - a map that never updates and a session signing out
+     * does not repair.
+     */
+    private void onAgreeToTerms() {
+        final TermsDocument document = this.termsDocuments.get(this.termsIndex);
+        this.showLoading(R.string.terms_recording_agreement);
+
+        var async = this.authService.acceptTerms(this.termsAccount, document.getPageId())
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(accepted -> {
+                    if (accepted.hasMore()) {
+                        this.termsIndex++;
+                        this.showTermsStep(Direction.FORWARD);
+                        return;
+                    }
+
+                    if (!accepted.isSignedIn()) {
+                        Log.e(TAG, "Terms accepted but signing in ended at "
+                                + accepted.getLoginState() + ", so nothing will be stored");
+                        this.showLoginFailure(new PythonAccountLoginException(
+                                this.getString(R.string.login_failed_terms),
+                                PythonAccountLoginException.REASON_TERMS));
+                        return;
+                    }
+
+                    Log.i(TAG, "Terms accepted and signing in completed");
+                    this.getUiState().setAuthResponse(new PythonAuthResponse(
+                            this.termsAccount, PythonAuthService.LOGIN_STATE.LOGGED_IN, null));
+                    this.termsAccount = null;
+                    this.termsDocuments = List.of();
+                    this.handleIsAlreadyLoggedIn();
+                }, error -> {
+                    Log.e(TAG, "Could not record agreement to " + document.getPageId(), error);
+                    this.showLoginFailure(error);
+                });
+    }
+
+    /**
+     * The failure the error box is currently showing, for the report page to name.
+     *
+     * <p>Kept rather than re-derived: {@link #describeLoginFailure} produces a sentence for a
+     * person, and the report page wants the exception - class and message - which is a different
+     * string and the one worth pasting into an issue.
+     */
+    private Throwable lastLoginFailure;
+
+    /** Hand the sign-in step back to the user with the failure on it. */
+    private void showLoginFailure(final Throwable error) {
+        this.hideLoading();
+        this.showPage(R.id.login_maininfo_container, Direction.BACK);
+
+        this.findViewById(R.id.email_or_phone_input_field).setEnabled(true);
+        this.findViewById(R.id.password_input_field).setEnabled(true);
+        this.findViewById(R.id.login_button_main).setClickable(true);
+
+        this.lastLoginFailure = error;
+        this.findViewById(R.id.login_error_container).setVisibility(VISIBLE);
+        ((TextView) this.findViewById(R.id.login_error_message_text))
+                .setText(this.describeLoginFailure(error));
+
+        // Offer the server route only when Apple itself refused the sign-in - a 429 or 503, or
+        // a refusal before the password was used (#248) - and not for a wrong password or a dead
+        // network, where a different Anisette identity changes nothing. Those are the failures
+        // where local Anisette worked and Apple still said no, so switching the machine identity
+        // a server presents is the thing left to try.
+        final String reason = error instanceof PythonAccountLoginException
+                ? ((PythonAccountLoginException) error).getReason()
+                : PythonAccountLoginException.REASON_UNKNOWN;
+        final boolean appleRefused = PythonAccountLoginException.REASON_APPLE_DECLINED.equals(reason)
+                || PythonAccountLoginException.REASON_REFUSED_BEFORE_PASSWORD.equals(reason);
+        this.findViewById(R.id.login_error_try_remote_anisette).setVisibility(
+                appleRefused ? VISIBLE : GONE);
+    }
+
+    /**
+     * Take a refused sign-in to the server-configuration step, with the server field forced on.
+     *
+     * <p>The field hides itself when local Anisette works, which is the state this device is in -
+     * so {@link #forceAnisetteServerField} is what brings it back, and {@link #onClickToLoginAccount}
+     * reads the same flag to persist remote mode when the user proceeds. There is no Settings to
+     * send them to instead: it is behind the sign-in this cannot complete.
+     */
+    private void onClickTryRemoteAnisette() {
+        Log.d(TAG, "Login was refused by Apple; offering the remote Anisette server route");
+        this.forceAnisetteServerField = true;
+        this.findViewById(R.id.login_error_container).setVisibility(GONE);
+        this.showInitialWelcomeConfOptions(SETUP_STATUS.NO_SERVER_CONFIGURED, Direction.BACK);
+    }
+
+    /**
+     * Open the report page on the failure just shown.
+     *
+     * <p><b>A separate activity on purpose.</b> Closing it returns here with the error box still
+     * up and the typed Apple ID still in place, so looking at the log costs the user nothing -
+     * which matters because the alternative was a second machine running adb.
+     */
+    private void openTheReportPageForTheLoginFailure() {
+        this.startActivity(ErrorReportActivity.intentFor(
+                this,
+                ErrorReportActivity.describe(ErrorReportActivity.rootOf(this.lastLoginFailure)),
+                R.string.error_report_body_login));
+    }
+
+    /**
+     * What to put on screen when a sign-in fails.
+     *
+     * <p><b>Never an empty message.</b> This used to be {@code login_failed_x} with
+     * {@code getLocalizedMessage()}, and the most common real failure - a connection timeout -
+     * carries no message at all, so the screen showed "Login failed:" and stopped. A person
+     * cannot tell from that whether they typed their password wrong, whether Apple is down, or
+     * whether the app is broken.
+     *
+     * <p>A recognised reason gets a translated sentence that says what to do. Anything else
+     * falls back to the detail, which at least names the exception - unhelpful, but honest,
+     * and better than a guess at a cause we have not established.
+     */
+    private String describeLoginFailure(final Throwable error) {
+        final String reason = error instanceof PythonAccountLoginException
+                ? ((PythonAccountLoginException) error).getReason()
+                : PythonAccountLoginException.REASON_UNKNOWN;
+
+        if (PythonAccountLoginException.REASON_NETWORK.equals(reason)) {
+            return this.getString(R.string.login_failed_network);
+        }
+
+        // **Before the fallback, which would show "The Grand Slam request was refused with HTTP
+        // 503" verbatim.** That is accurate and reads as a bug in this app, which is how issue
+        // #176 came to be filed. Nothing about the Apple ID or the password is wrong here.
+        if (PythonAccountLoginException.REASON_APPLE_DECLINED.equals(reason)) {
+            // Apple's own wait replaces the "try again shortly" advice when it named one - it is
+            // the only reliable answer to "how long". It usually has not, and then nothing here
+            // invents a number: a guess too short is refused again.
+            final Double wait = ((PythonAccountLoginException) error).getRetryAfterSeconds();
+            if (wait != null) {
+                return this.getString(R.string.login_failed_apple_asked_to_wait,
+                        HowLongToWait.of(wait).describe(
+                                this.getResources().getConfiguration().getLocales().get(0)));
+            }
+            return this.getString(R.string.login_failed_apple_declined);
+        }
+
+        // Refused before the password was used (#248), so the sentence says that retyping it
+        // will not help. Apple's own text follows, because it carries the ec a report needs.
+        if (PythonAccountLoginException.REASON_REFUSED_BEFORE_PASSWORD.equals(reason)) {
+            return this.getString(R.string.login_failed_refused_before_password,
+                    error.getLocalizedMessage());
+        }
+
+        // Apple took the password and the code, then would not open iCloud for the account. Kept
+        // apart from the terms sentence because the remedy is elsewhere entirely, and apart from
+        // "Apple declined" because that one says to wait - see REASON_ICLOUD_REFUSED.
+        if (PythonAccountLoginException.REASON_ICLOUD_REFUSED.equals(reason)) {
+            return this.getString(R.string.login_failed_icloud_refused);
+        }
+
+        // Reached when the terms path was tried and produced nothing to accept, so the sentence
+        // says what Apple said and then that accepting terms will not fix something else -
+        // rather than asserting a cause that has not been established.
+        if (PythonAccountLoginException.REASON_TERMS.equals(reason)) {
+            return this.getString(R.string.login_failed_terms);
+        }
+
+        final String detail = error.getLocalizedMessage();
+        return detail == null || detail.isBlank()
+                ? this.getString(R.string.login_failed_x, error.getClass().getSimpleName())
+                : this.getString(R.string.login_failed_x, detail);
     }
 
     private void handleLoginResponse(PythonAuthResponse authResponse) {
@@ -361,10 +878,10 @@ public class AppleLoginActivity extends AppCompatActivity {
         Log.d(TAG, "Login state was " + loginState);
         this.getUiState().setAuthResponse(authResponse);
 
-        this.showNextAuthPage(loginState);
+        this.showNextAuthPage(loginState, Direction.FORWARD);
     }
 
-    private void showNextAuthPage(PythonAuthService.LOGIN_STATE loginState) {
+    private void showNextAuthPage(PythonAuthService.LOGIN_STATE loginState, Direction direction) {
         switch (loginState) {
             case LOGGED_OUT:
                 // TODO: invalid password?
@@ -377,23 +894,20 @@ public class AppleLoginActivity extends AppCompatActivity {
                 break;
             case REQUIRE_2FA:
                 // require 2FA!
-                this.show2FAChoiceScreen();
+                this.show2FAChoiceScreen(direction);
                 break;
         }
     }
 
-    private void show2FAChoiceScreen() {
+    private void show2FAChoiceScreen(Direction direction) {
         var state = this.getUiState();
         state.setCurrentPage(PAGE.CHOOSE_2FA);
 
         PythonAuthResponse authResponse = state.getAuthResponse();
-        // TODO: make this all nice and animated...
         // determine which options should be shown:
         this.hideLoading();
-        LinearLayout twoFACodeEntryContainer = this.findViewById(R.id.login_2fa_container);
-        twoFACodeEntryContainer.setVisibility(GONE);
 
-        this.setCurrentStepText(R.string.two_factor_authentication);
+        this.setCurrentStepText(R.string.two_factor_authentication, direction);
         Button trustedDeviceButton = this.findViewById(R.id.twofactorauth_choice_trusted_device);
         final boolean hasTrustedDevice = authResponse.getAuthMethods().stream().anyMatch(authMethod -> authMethod.getType() == TRUSTED_DEVICE);
         trustedDeviceButton.setVisibility(hasTrustedDevice ? VISIBLE : GONE);
@@ -422,8 +936,9 @@ public class AppleLoginActivity extends AppCompatActivity {
                     this.getUiState().getSms2FAButtonToAuthMethod().put(v, authMethodPhone);
                 });
 
-        LinearLayout accountLoginContainer = this.findViewById(R.id.login_2fa_choice);
-        accountLoginContainer.setVisibility(VISIBLE);
+        // Shown last, so the options above are in place before it slides in rather than
+        // appearing one by one on a view the user is already looking at.
+        this.showPage(R.id.login_2fa_choice, direction);
     }
 
     public void onClick2FAWithTrustedDevice(View view) {
@@ -434,13 +949,12 @@ public class AppleLoginActivity extends AppCompatActivity {
 
         this.getUiState().setChosenAuthMethod(chosenAuthMethod);
 
-        LinearLayout accountLoginContainer = this.findViewById(R.id.login_2fa_choice);
-        accountLoginContainer.setVisibility(GONE);
+        this.hideCurrentPage(Direction.FORWARD);
         this.showLoading(R.string.requesting_code);
 
-        var async = PythonAuthService.requestCode(chosenAuthMethod)
+        var async = this.authService.requestCode(chosenAuthMethod)
                 .observeOn(AndroidSchedulers.mainThread())
-                .subscribe(this::show2FACodeEntryTextbox,
+                .subscribe(() -> this.show2FACodeEntryTextbox(Direction.FORWARD),
                 error -> {
                     Log.e(TAG, "Error occurred when trying to request 2FA code from Trusted Devices", error);
                     this.hideLoading();
@@ -455,13 +969,12 @@ public class AppleLoginActivity extends AppCompatActivity {
         this.getUiState().setChosenAuthMethod(phoneAuthMethod);
 
         // TODO: try to do the auth
-        LinearLayout accountLoginContainer = this.findViewById(R.id.login_2fa_choice);
-        accountLoginContainer.setVisibility(GONE);
+        this.hideCurrentPage(Direction.FORWARD);
         this.showLoading(R.string.requesting_code);
 
-        var async = PythonAuthService.requestCode(phoneAuthMethod)
+        var async = this.authService.requestCode(phoneAuthMethod)
                 .observeOn(AndroidSchedulers.mainThread())
-                .subscribe(this::show2FACodeEntryTextbox,
+                .subscribe(() -> this.show2FACodeEntryTextbox(Direction.FORWARD),
                 error -> {
                     Log.e(TAG, "Error occurred when trying to request 2FA code to SMS for phone number " + phoneAuthMethod.getPhoneNumber(), error);
                     this.hideLoading();
@@ -470,32 +983,48 @@ public class AppleLoginActivity extends AppCompatActivity {
                 });
     }
 
-    private void showInitialWelcomeConfOptions(SETUP_STATUS setupStatus) {
+    private void showInitialWelcomeConfOptions(SETUP_STATUS setupStatus, Direction direction) {
         var state = this.getUiState();
         state.setCurrentPage(PAGE.SETUP);
-        LinearLayout accountLoginContainer = this.findViewById(R.id.login_maininfo_container);
-        accountLoginContainer.setVisibility(GONE);
 
-        // TODO: make this all nice and animated...
         final UserSettings userSettings = this.getUserSettings();
 
-        LinearLayout anisetteSetupContainer = this.findViewById(R.id.login_anisette_container);
-        anisetteSetupContainer.setVisibility(VISIBLE);
+        this.showPage(R.id.login_anisette_container, direction);
 
         MaterialAutoCompleteTextView urlTextInput = findViewById(R.id.anisetteServerUrl);
 
-        var properties = PropertiesUtil.getProperties(this.getAssets(), "app.properties");
-        assert properties != null;
-
-        final String currentAnisetteServerSelection = Optional.ofNullable(userSettings.getAnisetteServerUrl())
-                .orElse(properties.getProperty("defaultAnisetteUrl"));
+        final String currentAnisetteServerSelection = this.getAnisetteServerUrlOrDefault();
         urlTextInput.setText(currentAnisetteServerSelection);
+
+        // The server field only exists on this screen for the case where signing in cannot
+        // happen without it. Deciding that here, from what local Anisette actually said,
+        // rather than leaving it permanently on or permanently off.
+        SharedMainSettingsManager.applyLoginAnisetteFallback(
+                this.findViewById(android.R.id.content),
+                this.localAnisetteStatus,
+                userSettings.hasChosenAnisetteMode()
+                        && !userSettings.usesLocalAnisette(false),
+                this.forceAnisetteServerField);
+
+        // Skipped when forced here by a refused sign-in: local Anisette is READY, but the user is
+        // on this step precisely to switch away from it, so the server they choose has to be
+        // tested and the Next button gated on it exactly as it is for a device that has no choice.
+        if (this.localAnisetteStatus.state() == AnisetteStatus.State.READY
+                && !this.forceAnisetteServerField) {
+            // Nothing is going to ask a server for anything, so testing one would be a network
+            // request whose only possible effect is to block the button below it.
+            this.setCurrentStepText(R.string.welcome, direction);
+            this.binding.setAllowServerConfNext(true);
+            return;
+        }
+
         this.testAndSaveAnisetteUrl(currentAnisetteServerSelection);
 
-        if (setupStatus == SETUP_STATUS.NO_SERVER_CONFIGURED) {
-            this.setCurrentStepText(R.string.welcome);
+        if (setupStatus == SETUP_STATUS.NO_SERVER_CONFIGURED
+                || setupStatus == SETUP_STATUS.NEEDS_COREADI) {
+            this.setCurrentStepText(R.string.welcome, direction);
         } else {
-            this.setCurrentStepText(R.string.choose_your_server);
+            this.setCurrentStepText(R.string.choose_your_server, direction);
 
             this.sharedMainSettingsManager.showAnisetteTestStatus(ERROR);
             this.sharedMainSettingsManager.setAnisetteTextFieldError(
@@ -505,44 +1034,75 @@ public class AppleLoginActivity extends AppCompatActivity {
         }
     }
 
-    private void showAccountLoginAuthOptions() {
-        // TODO: make this all nice and animated...
-        LinearLayout anisetteSetupContainer = this.findViewById(R.id.login_anisette_container);
-        anisetteSetupContainer.setVisibility(GONE);
+    private void showAccountLoginAuthOptions(Direction direction) {
+        this.showPage(R.id.login_maininfo_container, direction);
 
-        LinearLayout login2FAChoice = this.findViewById(R.id.login_2fa_choice);
-        login2FAChoice.setVisibility(GONE);
-
-        // main:
-        LinearLayout accountLoginContainer = this.findViewById(R.id.login_maininfo_container);
-        accountLoginContainer.setVisibility(VISIBLE);
-
-        this.setCurrentStepText(R.string.apple_account);
+        this.setCurrentStepText(R.string.apple_account, direction);
 
         TextInputEditText emailOrPhoneInput = this.findViewById(R.id.email_or_phone_input_field);
         TextInputEditText passwordInput = this.findViewById(R.id.password_input_field);
 
-        emailOrPhoneInput.addTextChangedListener(justWatchOnChanged((s, start, before, count) -> {
-            final String currentEmailOrPhone = s.toString();
-            this.getUiState().setValidEmailOrPhone(isEmailOrPhoneNumber(currentEmailOrPhone));
-            this.updateLoginButtonState();
-        }));
+        // **Attached once.** This method runs again every time the page is shown - coming back
+        // from the 2FA step, from the terms step - and addTextChangedListener appends, so
+        // without the guard each keystroke ends up firing a growing pile of identical watchers.
+        if (!this.loginFieldWatchersAttached) {
+            this.loginFieldWatchersAttached = true;
 
-        passwordInput.addTextChangedListener(justWatchOnChanged((s, start, before, count) -> {
-            final String currentPassword = s.toString();
-            this.getUiState().setValidPassword(!currentPassword.isEmpty());
-            this.updateLoginButtonState();
-        }));
+            emailOrPhoneInput.addTextChangedListener(justWatchOnChanged((s, start, before, count) -> {
+                final String currentEmailOrPhone = s.toString();
+                this.getUiState().setValidEmailOrPhone(isEmailOrPhoneNumber(currentEmailOrPhone));
+                this.updateLoginButtonState();
+            }));
+
+            passwordInput.addTextChangedListener(justWatchOnChanged((s, start, before, count) -> {
+                final String currentPassword = s.toString();
+                this.getUiState().setValidPassword(!currentPassword.isEmpty());
+                this.updateLoginButtonState();
+            }));
+        }
+
+        // **Read what is already in the fields, rather than waiting to be told it changed.**
+        //
+        // A watcher only hears about edits made after it exists, and the email is prefilled in
+        // onCreate - before this page is ever shown - when somebody is sent back here after
+        // their session expired. So the watcher never saw it, `validEmailOrPhone` stayed false,
+        // and typing the password could not enable the button no matter what was typed: the
+        // screen showed a filled-in email beside a dead Sign in button, with nothing to explain
+        // it and no way to proceed except retyping an address that was already correct.
+        //
+        // Seeding from the fields covers every way text can arrive without an edit event -
+        // prefill, restored instance state, an autofill service - rather than special-casing
+        // the one that was reported.
+        this.recheckWhetherLoginIsPossible();
     }
 
-    private void show2FACodeEntryTextbox() {
+    /** Whether {@link #showAccountLoginAuthOptions} has already added its field watchers. */
+    private boolean loginFieldWatchersAttached = false;
+
+    /**
+     * Work out from the fields themselves whether signing in is possible, and update the button.
+     *
+     * <p>The same two rules the watchers apply, asked of the current contents instead of an edit.
+     */
+    private void recheckWhetherLoginIsPossible() {
+        final String email = Optional.ofNullable(this.emailOrPhoneInput.getText())
+                .map(CharSequence::toString).orElse("");
+        final String password = Optional.ofNullable(this.passwordInput.getText())
+                .map(CharSequence::toString).orElse("");
+
+        this.getUiState().setValidEmailOrPhone(isEmailOrPhoneNumber(email));
+        this.getUiState().setValidPassword(!password.isEmpty());
+
+        this.updateLoginButtonState();
+    }
+
+    private void show2FACodeEntryTextbox(Direction direction) {
         this.getUiState().setCurrentPage(PAGE.ENTER_2FA_CODE);
 
         this.hideLoading();
-        this.setCurrentStepText(R.string.two_factor_authentication);
+        this.setCurrentStepText(R.string.two_factor_authentication, direction);
 
-        LinearLayout twoFACodeEntryContainer = this.findViewById(R.id.login_2fa_container);
-        twoFACodeEntryContainer.setVisibility(VISIBLE);
+        this.showPage(R.id.login_2fa_container, direction);
 
         TextView infoText = this.findViewById(R.id.twofa_sent_info_text);
         var chosenAuthMethod = this.getUiState().getChosenAuthMethod();
@@ -575,7 +1135,7 @@ public class AppleLoginActivity extends AppCompatActivity {
         passwordInput.setEnabled(true);
         loginButton.setClickable(true);
 
-        this.showAccountLoginAuthOptions();
+        this.showAccountLoginAuthOptions(Direction.BACK);
     }
 
     public void onClickBackTo2FAMethodChoice(View view) {
@@ -588,7 +1148,125 @@ public class AppleLoginActivity extends AppCompatActivity {
         this.twoFactorEntryManager.clear();
         final FrameLayout twoFactorErrorMessage = this.findViewById(R.id.verification_code_error_msg_container);
         twoFactorErrorMessage.setVisibility(GONE); // re-show it later if relevant...
-        this.show2FAChoiceScreen();
+
+        // **The countdown belongs to the screen being left.** Leaving it running does two
+        // things, and the visible one is the lesser: a second failure starts a second
+        // countdown, both tick into the same error line, and the user watches two timers
+        // disagree. The worse one is silent - on reaching zero it asks Apple for a fresh code
+        // from a screen the user is no longer on, for a method they may no longer have chosen.
+        this.stopWaitingForApple();
+
+        this.show2FAChoiceScreen(Direction.BACK);
+    }
+
+    /**
+     * How many times a spent code has been waited out on this screen. Never reset on purpose:
+     * two goes at it is the budget for one sign-in, not per code.
+     */
+    private int spentCodeRecoveries = 0;
+
+    /** Cancelled if the screen goes away mid-wait, so a dead activity is not written to. */
+    private final Handler waitingForApple = new Handler(Looper.getMainLooper());
+
+    /**
+     * Apple took the code and then failed. Wait, then ask for a new one - without a prompt.
+     *
+     * <p><b>There is no question worth asking, so none is asked.</b> Re-typing cannot work and
+     * waiting is the only option, so a dialog would offer a choice between one real answer and a
+     * wrong one. The exporter reached the same conclusion and has a test asserting the user is
+     * never prompted.
+     *
+     * <p><b>The wait is shown counting down.</b> Two minutes of a still screen on a phone is
+     * indistinguishable from a hang, and gets force-quit.
+     *
+     * <p><b>And the new code is requested after the wait, never before.</b> Both orders look
+     * right in a diff; Apple's codes expire, so one fetched first is two minutes stale by the
+     * time it is typed.
+     *
+     * <p>The Apple ID and password are not asked for again. The account is still in its
+     * second-factor state, so requesting on the chosen method is all that is needed.
+     */
+    private void recoverFromApppleTakingTheCode(
+            final FrameLayout errorBox, final TextView errorText) {
+
+        final long wait = ACodeAppleAlreadyTook.waitBefore(this.spentCodeRecoveries);
+        this.spentCodeRecoveries++;
+
+        this.hideLoading();
+        this.showPage(R.id.login_2fa_container, Direction.BACK);
+        this.twoFactorEntryManager.clear();
+        this.twoFactorAuthChoiceBackButton.setEnabled(true);
+        errorBox.setVisibility(VISIBLE);
+
+        if (wait < 0) {
+            // Out of goes. Say whose fault it is, and warn about the password refusal - it
+            // happened in the one observed recovery, and unwarned it reads as a second,
+            // unrelated problem.
+            Log.w(TAG, "Apple did not recover after waiting it out twice");
+            errorText.setText(R.string.twofactor_apple_did_not_recover);
+            return;
+        }
+
+        Log.i(TAG, "Apple took the code and then failed; waiting " + wait
+                + "ms before asking for a new one");
+        errorText.setText(R.string.twofactor_apple_took_the_code);
+        this.stopWaitingForApple();
+        this.countDownThenAskForANewCode(wait, errorBox, errorText);
+    }
+
+    private void countDownThenAskForANewCode(
+            final long remaining, final FrameLayout errorBox, final TextView errorText) {
+        if (this.isFinishing() || this.isDestroyed()) {
+            return;
+        }
+
+        if (remaining <= 0) {
+            final var chosen = this.getUiState().getChosenAuthMethod();
+            if (chosen == null) {
+                errorText.setText(R.string.twofactor_apple_did_not_recover);
+                return;
+            }
+
+            var async = this.authService.requestCode(chosen)
+                    .observeOn(AndroidSchedulers.mainThread())
+                    .subscribe(
+                            () -> {
+                                // The box is already empty and the prompt above it still says
+                                // where the code was sent, so the error line's job is done.
+                                Log.i(TAG, "Asked Apple for a fresh code after the wait");
+                                errorBox.setVisibility(GONE);
+                            },
+                            error -> {
+                                Log.e(TAG, "Asking for a fresh code failed too", error);
+                                errorText.setText(R.string.twofactor_apple_did_not_recover);
+                            });
+            return;
+        }
+
+        errorText.setText(this.getString(
+                R.string.twofactor_waiting_seconds, (int) Math.ceil(remaining / 1000.0)));
+
+        this.waitingForApple.postDelayed(
+                () -> this.countDownThenAskForANewCode(remaining - 1000L, errorBox, errorText),
+                1000L);
+    }
+
+    /**
+     * Stop any countdown waiting out a spent code.
+     *
+     * <p>Called wherever the 2FA code screen is left or restarted, because the countdown is
+     * <b>not</b> tied to the activity lifecycle - these are pages inside one activity, so going
+     * back is not a destroy and nothing else cancels it.
+     */
+    private void stopWaitingForApple() {
+        this.waitingForApple.removeCallbacksAndMessages(null);
+    }
+
+    @Override
+    protected void onDestroy() {
+        // Or a countdown outlives the screen and writes to views that are gone.
+        this.stopWaitingForApple();
+        super.onDestroy();
     }
 
     private void on2FAAuthCodeFilled(final String authCode) {
@@ -598,21 +1276,20 @@ public class AppleLoginActivity extends AppCompatActivity {
         }
 
         this.showLoading(R.string.logging_in);
-        final LinearLayout twoFACodeEntryContainer = this.findViewById(R.id.login_2fa_container);
-        twoFACodeEntryContainer.setVisibility(GONE); // for now: on error unhide
+        this.hideCurrentPage(Direction.FORWARD); // for now: on error unhide
 
         final FrameLayout twoFactorErrorMessage = this.findViewById(R.id.verification_code_error_msg_container);
         final TextView errorMessageText = this.findViewById(R.id.verification_code_error_message);
 
         var chosenAuthMethod = this.getUiState().getChosenAuthMethod();
 
-        var async = PythonAuthService.submitCode(
+        var async = this.authService.submitCode(
                 Objects.requireNonNull(chosenAuthMethod),
                 authCode
         ).observeOn(AndroidSchedulers.mainThread())
         .subscribe(() -> {
 
-            var nextAsync = PythonAuthService.retrieveAuthData(this.getUiState().getAuthResponse())
+            var nextAsync = this.authService.retrieveAuthData(this.getUiState().getAuthResponse())
                 .flatMapCompletable(userAuthRepo::storeUserAuth)
                 .observeOn(AndroidSchedulers.mainThread())
                 .subscribe(() -> {
@@ -622,7 +1299,7 @@ public class AppleLoginActivity extends AppCompatActivity {
 
                     Log.e(TAG, "Error during auth data retrieval and storage after 2FA success", error);
                     this.hideLoading();
-                    twoFACodeEntryContainer.setVisibility(VISIBLE);
+                    this.showPage(R.id.login_2fa_container, Direction.BACK);
                     this.twoFactorEntryManager.clear();
                     this.twoFactorAuthChoiceBackButton.setEnabled(true);
 
@@ -634,12 +1311,23 @@ public class AppleLoginActivity extends AppCompatActivity {
         }, error -> {
             // I really would like to handle this error separately from the one above, hence the nesting above.
             Log.e(TAG, "Failed to authenticate using auth code " + authCode, error);
+
+            // **Apple taking the code and then failing is not a wrong code**, and must be told
+            // apart before anything counts it as one. See ACodeAppleAlreadyTook: the submit does
+            // two calls, the first succeeded, and the code is spent - so returning to the code
+            // box is the one action guaranteed to fail, and the attempt counter would eventually
+            // advise changing the Anisette server for a fault Anisette had no part in.
+            if (ACodeAppleAlreadyTook.spentIt(error)) {
+                this.recoverFromApppleTakingTheCode(twoFactorErrorMessage, errorMessageText);
+                return;
+            }
+
             var state = this.getUiState();
             final int failedLoginAttemptCount = state.getFailed2FAAttemptCount() + 1;
             state.setFailed2FAAttemptCount(failedLoginAttemptCount);
 
             this.hideLoading();
-            twoFACodeEntryContainer.setVisibility(VISIBLE);
+            this.showPage(R.id.login_2fa_container, Direction.BACK);
             this.twoFactorEntryManager.clear();
             this.twoFactorAuthChoiceBackButton.setEnabled(true);
 
@@ -654,7 +1342,7 @@ public class AppleLoginActivity extends AppCompatActivity {
     }
 
     private void handleIsAlreadyLoggedIn() {
-        var async = PythonAuthService.retrieveAuthData(this.getUiState().getAuthResponse())
+        var async = this.authService.retrieveAuthData(this.getUiState().getAuthResponse())
             .observeOn(AndroidSchedulers.mainThread())
             .flatMapCompletable(userAuthRepo::storeUserAuth)
             .subscribe(() -> {
@@ -673,6 +1361,38 @@ public class AppleLoginActivity extends AppCompatActivity {
         this.binding.setAllowAccountLogin(
                 state.isValidEmailOrPhone() && state.isValidPassword()
         );
+    }
+
+    /**
+     * Whether this screen can get somebody signed in, and what it has to ask for first.
+     *
+     * <p>Local Anisette is asked first, because when it works none of the server questions
+     * have a reason to be asked - and that is the normal case. Only when it cannot does this
+     * fall back to the old behaviour of testing a server and, if that fails too, sending the
+     * user to choose one.
+     *
+     * <p>The local check downloads and can talk to Apple, so it runs off the main thread. The
+     * spinner {@link #handleAuth} shows covers it, and doing it here means the cost lands on
+     * the welcome screen rather than on the login button.
+     */
+    private Observable<SETUP_STATUS> getAnisetteSetupStatus() {
+        return Observable.fromCallable(() -> AnisetteStatus.of(this.localAnisette))
+                .subscribeOn(Schedulers.io())
+                .flatMap(status -> {
+                    this.localAnisetteStatus = status;
+                    Log.i(TAG, "local Anisette on the sign-in screen: " + status);
+
+                    if (status.state() == AnisetteStatus.State.READY) {
+                        return Observable.just(SETUP_STATUS.OK);
+                    }
+                    // Not OK even when a stored server answers. That server would sign in
+                    // and then fail every fetch, and OK skips this step, so nobody would ever
+                    // see the offer of the file that would actually fix it.
+                    if (status.needsCoreAdi()) {
+                        return Observable.just(SETUP_STATUS.NEEDS_COREADI);
+                    }
+                    return this.getAnisetteServerSetupStatus();
+                });
     }
 
     private Observable<SETUP_STATUS> getAnisetteServerSetupStatus() {
@@ -694,6 +1414,23 @@ public class AppleLoginActivity extends AppCompatActivity {
                 Log.d(TAG, "Server did not seem available @ " + currentServerUrl);
                 return SETUP_STATUS.SERVER_UNAVAILABLE;
             });
+    }
+
+    /**
+     * The Anisette server to fall back to, which may never have been chosen.
+     *
+     * <p>Before Anisette was produced on the device, nobody reached the login button without
+     * passing a server test first, so the stored URL was always set by then. That is no longer
+     * true: a sign-in that needs no server never visits that step, and reading the setting
+     * without allowing for null would fail the login of exactly the people for whom everything
+     * had gone right.
+     */
+    private String getAnisetteServerUrlOrDefault() {
+        var properties = PropertiesUtil.getProperties(this.getAssets(), "app.properties");
+        assert properties != null;
+
+        return Optional.ofNullable(this.getUserSettings().getAnisetteServerUrl())
+                .orElse(properties.getProperty("defaultAnisetteUrl"));
     }
 
     private UserSettings getUserSettings() {
@@ -722,6 +1459,24 @@ public class AppleLoginActivity extends AppCompatActivity {
     }
 
     private void updateMapProvider(final String newProvider) {
+        // AMap needs a key the user supplies themselves, so selecting it here without one
+        // would silently save a provider that can only render a blank map. Prompt instead,
+        // and only apply the choice once a key exists.
+        if ("amap".equals(newProvider) && !this.getUserSettings().hasAmapApiKey()) {
+            AmapApiKeyDialog.show(this, this.getUserSettings().getAmapApiKey(), enteredKey -> {
+                if (enteredKey == null) {
+                    Toast.makeText(this, R.string.amap_key_required, Toast.LENGTH_LONG).show();
+                    this.sharedMainSettingsManager.setupMapProviderField();
+                    return;
+                }
+                this.getUserSettings().setAmapApiKey(enteredKey);
+                this.getUserSettings().setMapProvider(newProvider);
+                this.saveSettings();
+                Log.i(TAG, "Updating app settings map provider to " + newProvider);
+            });
+            return;
+        }
+
         this.getUserSettings().setMapProvider(newProvider);
         this.saveSettings();
         Log.i(TAG, "Updating app settings map provider to " + newProvider);
@@ -741,19 +1496,134 @@ public class AppleLoginActivity extends AppCompatActivity {
     }
 
     private void sendToMapActivity() {
+        this.recordHowThisSessionWasEstablished();
+
         this.model.resetUiState();
         this.finish();
-        Intent intent = new Intent(this, MapsActivity.class);
+        // The first sign-in on this install goes through the onboarding steps, which open the
+        // map when they are done. Only here: opening the app signed in skips this screen.
+        Intent intent = new Intent(this, OnboardingActivity.isDue(this)
+                ? OnboardingActivity.class : MapsActivity.class);
         startActivity(intent);
+    }
+
+    /**
+     * Write down what actually produced this session, now that there is one.
+     *
+     * <p>Without this, a brand-new sign-in leaves the mode unchosen - and "signed in with no
+     * mode chosen" is exactly how somebody updating from an older version looks. So a person
+     * who had just signed in using Anisette from their own phone was offered the chance to
+     * switch to Anisette from their own phone, at the price of signing in again. It also left
+     * Settings with nothing to show under "Anisette Provider", because the only thing it had
+     * to show was a server URL that a local sign-in never sets.
+     *
+     * <p>This does not defeat the null-is-meaningful rule in {@link UserSettings}: null still
+     * means nobody has decided, and someone who updated from a version without any of this
+     * never ran this code, so they keep it and still get asked once.
+     *
+     * <p><b>Read, not guessed.</b> Which kind actually produced the session is decided inside
+     * the Python sign-in, which consults local Anisette itself and falls back on its own - so
+     * it records the answer, and this only copies it. Inferring it here from the status shown
+     * when the screen opened would be wrong in precisely the interesting case: a sign-in that
+     * began local and fell back part-way would be filed as local.
+     */
+    private void recordHowThisSessionWasEstablished() {
+        if (this.localAnisette == null) {
+            return;
+        }
+
+        final boolean establishedLocally = this.localAnisette.wasSessionEstablishedLocally();
+
+        this.getUserSettings().setAnisetteMode(establishedLocally
+                ? UserSettings.ANISETTE_LOCAL : UserSettings.ANISETTE_REMOTE);
+        this.saveSettings();
+
+        Log.i(TAG, "session established with "
+                + (establishedLocally ? "local" : "remote") + " Anisette");
     }
 
     private LoginActivityState getUiState() {
         return Objects.requireNonNull(this.model.getUiState().getValue());
     }
 
+    /**
+     * Picks the iTunes 12.8.3 disk image, or CoreADI itself, for a phone that could not download
+     * it. {@code OpenDocument}, so a 291 MB file is read where it lies rather than copied first.
+     */
+    private final ActivityResultLauncher<String[]> pickCoreAdiLauncher =
+            registerForActivityResult(new ActivityResultContracts.OpenDocument(), uri -> {
+                if (uri != null) {
+                    this.importCoreAdi(uri);
+                }
+            });
+
+    /**
+     * Store a CoreADI the user chose, then check Anisette again.
+     *
+     * <p>Off the main thread: a disk image is skipped through to its payload, then unpacked and
+     * hashed. Checked against the same pins as the download, so nothing chosen here can run code
+     * the download would have refused.
+     */
+    private void importCoreAdi(final Uri chosen) {
+        final View root = this.findViewById(android.R.id.content);
+        SharedMainSettingsManager.applyCoreAdiRejection(root, null);
+        this.showLoading(null);
+
+        var async = Observable.fromCallable(() -> {
+                    try (InputStream in = this.getContentResolver().openInputStream(chosen)) {
+                        if (in == null) {
+                            return Optional.of("the file could not be opened");
+                        }
+                        MacCoreAdiFetcher.importFrom(in, EmulatedMacAnisette.libraryFile(this));
+                        return Optional.<String>empty();
+                    } catch (final MacCoreAdiFetcher.FetchException e) {
+                        Log.w(TAG, "the chosen file is not CoreADI", e);
+                        return Optional.of(String.valueOf(e.getMessage()));
+                    }
+                })
+                .subscribeOn(Schedulers.io())
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(problem -> {
+                    this.hideLoading();
+                    if (problem.isPresent()) {
+                        SharedMainSettingsManager.applyCoreAdiRejection(root, problem.get());
+                        return;
+                    }
+                    this.checkAnisetteAgain();
+                }, error -> {
+                    this.hideLoading();
+                    Log.e(TAG, "could not import the chosen CoreADI", error);
+                    SharedMainSettingsManager.applyCoreAdiRejection(root,
+                            String.valueOf(error.getMessage()));
+                });
+    }
+
+    /** Ask local Anisette again from scratch: after a supplied file, or a network that recovered. */
+    private void checkAnisetteAgain() {
+        // A fresh source, so nothing it remembered about the failure carries over.
+        this.localAnisette = AppDependencies.anisette(this, this.getUserSettings(), false);
+        // Aimed at the account form, as a phone that worked from the start would be. handleAuth
+        // only goes there for LOGIN or no page, and this screen's page is still the welcome
+        // step; when the answer is still no, it comes back here anyway.
+        this.getUiState().setCurrentPage(PAGE.LOGIN);
+        this.handleAuth(this.getUiState());
+    }
+
+    private void copyCoreAdiLink() {
+        final ClipboardManager clipboard =
+                (ClipboardManager) this.getSystemService(Context.CLIPBOARD_SERVICE);
+        if (clipboard != null) {
+            clipboard.setPrimaryClip(ClipData.newPlainText("iTunes 12.8.3",
+                    MacCoreAdiFetcher.DMG_URL));
+            Toast.makeText(this, R.string.exported_tags_code_copied, Toast.LENGTH_SHORT).show();
+        }
+    }
+
     enum SETUP_STATUS {
         NO_SERVER_CONFIGURED,
         SERVER_UNAVAILABLE,
+        /** The emulated Mac has no CoreADI. Stops on this step, with the file offered. */
+        NEEDS_COREADI,
         OK;
     }
 }

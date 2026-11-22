@@ -1,11 +1,22 @@
 package dev.wander.android.opentagviewer;
 
+import androidx.core.content.ContextCompat;
+import androidx.core.app.ActivityCompat;
+import android.content.pm.PackageManager;
+import android.Manifest;
 import static android.view.View.GONE;
 import static android.view.View.VISIBLE;
 import static android.view.View.inflate;
 import static dev.wander.android.opentagviewer.util.android.TextChangedWatcherFactory.justWatchOnChanged;
 
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.Intent;
+import android.media.Ringtone;
+import android.media.RingtoneManager;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.util.Pair;
@@ -18,8 +29,12 @@ import android.widget.Button;
 import android.widget.CompoundButton;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import com.google.android.material.slider.Slider;
 import android.widget.Toast;
 
+import androidx.activity.result.ActivityResult;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.app.AppCompatDelegate;
@@ -28,13 +43,17 @@ import androidx.databinding.DataBindingUtil;
 
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
+import com.google.android.material.color.DynamicColors;
 import com.google.android.material.materialswitch.MaterialSwitch;
 import com.google.android.material.progressindicator.CircularProgressIndicatorSpec;
 import com.google.android.material.progressindicator.IndeterminateDrawable;
 import com.google.android.material.snackbar.Snackbar;
 import com.google.android.material.textfield.MaterialAutoCompleteTextView;
+import com.google.android.material.textfield.TextInputEditText;
 import com.google.android.material.textfield.TextInputLayout;
 
+import java.io.File;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -45,28 +64,49 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import dev.wander.android.opentagviewer.service.NearbyScanService;
+import dev.wander.android.opentagviewer.anisette.AdiLibraryImporter;
+import dev.wander.android.opentagviewer.anisette.AdiLibraryManifest;
+import dev.wander.android.opentagviewer.anisette.AnisetteSource;
+import dev.wander.android.opentagviewer.anisette.AnisetteStatus;
+import dev.wander.android.opentagviewer.anisette.EmulatedMacAnisette;
+import dev.wander.android.opentagviewer.anisette.LocalAnisette;
+import dev.wander.android.opentagviewer.anisette.MacCoreAdiFetcher;
 import dev.wander.android.opentagviewer.databinding.ActivitySettingsBinding;
 import dev.wander.android.opentagviewer.db.datastore.UserAuthDataStore;
 import dev.wander.android.opentagviewer.db.datastore.UserCacheDataStore;
 import dev.wander.android.opentagviewer.db.datastore.UserSettingsDataStore;
+import dev.wander.android.opentagviewer.db.repo.KeychainMembershipRepository;
 import dev.wander.android.opentagviewer.db.repo.UserAuthRepository;
 import dev.wander.android.opentagviewer.db.repo.UserSettingsRepository;
 import dev.wander.android.opentagviewer.db.repo.model.UserAuthData;
 import dev.wander.android.opentagviewer.db.repo.model.UserSettings;
+import dev.wander.android.opentagviewer.python.PythonAppleService;
+import dev.wander.android.opentagviewer.python.AppDependencies;
 import dev.wander.android.opentagviewer.service.web.AnisetteServerTesterService;
 import dev.wander.android.opentagviewer.service.web.CronetProvider;
 import dev.wander.android.opentagviewer.service.web.GitHubService;
 import dev.wander.android.opentagviewer.service.web.GithubRawUtilityFilesService;
 import dev.wander.android.opentagviewer.service.web.sidestore.AnisetteServerSuggestion;
 import dev.wander.android.opentagviewer.ui.compat.WindowPaddingUtil;
+import dev.wander.android.opentagviewer.ui.settings.AmapApiKeyDialog;
+import dev.wander.android.opentagviewer.ui.settings.SharedMainSettingsManager;
 import dev.wander.android.opentagviewer.ui.extensions.AppAutoCompleteTextView;
+import dev.wander.android.opentagviewer.update.UpdateSettingsRow;
 import dev.wander.android.opentagviewer.util.android.AppCryptographyUtil;
 import dev.wander.android.opentagviewer.util.android.LocaleConfigUtil;
+import dev.wander.android.opentagviewer.util.android.PropertiesUtil;
+import dev.wander.android.opentagviewer.util.android.SigningInfoUtil;
+import dev.wander.android.opentagviewer.util.android.WebLink;
 import dev.wander.android.opentagviewer.util.validate.AnisetteUrlValidatorUtil;
 import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers;
+import io.reactivex.rxjava3.core.Observable;
+import io.reactivex.rxjava3.disposables.Disposable;
+import io.reactivex.rxjava3.schedulers.Schedulers;
 import lombok.Data;
 import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
+import java.util.Objects;
 
 
 public class SettingsActivity extends AppCompatActivity {
@@ -95,6 +135,66 @@ public class SettingsActivity extends AppCompatActivity {
 
     private String initialAnisetteUrl = null;
     private boolean mapProviderChanged = false;
+
+    /**
+     * Whether the owner's own Apple devices were shown or hidden while this screen was open.
+     *
+     * <p>Reported back rather than acted on here, for the same reason as
+     * {@link #mapProviderChanged}: the map holds its tags in memory and that model decides both
+     * what it draws and what it asks Apple about, so it has to reload to notice.
+     */
+    private boolean shownDevicesChanged = false;
+
+    /**
+     * Whether connecting an iCloud account from here actually brought tags in.
+     *
+     * <p><b>Reported onward for the same reason as the two above, and it was not.</b> The map
+     * holds its tags in memory and reads them once, when it is created. Reaching the account
+     * flow from here goes Map to Settings to iCloud, so returning resumes the map rather than
+     * recreating it, and tags that were just imported are absent until the app is closed and
+     * reopened. They sat in the device list reading "No last location known", which looks like
+     * a fetch that failed rather than a screen that never learned they exist.
+     *
+     * <p>{@code FetchFromICloudActivity} has always said so - it sets
+     * {@link FetchFromICloudActivity#RESULT_IMPORTED} on the way out, and both the map and the
+     * device list act on it when they launch that screen themselves. This screen started it with
+     * {@code startActivity}, which discards the result, so the one path through Settings was the
+     * one path that dropped the signal.
+     */
+    private boolean importedFromAccount = false;
+
+    /**
+     * Connecting an iCloud account, started from the row on this screen.
+     *
+     * <p>For a result, not fire-and-forget: see {@link #importedFromAccount}.
+     */
+    private final ActivityResultLauncher<Intent> fetchFromICloudLauncher = registerForActivityResult(
+            new ActivityResultContracts.StartActivityForResult(),
+            (ActivityResult result) -> {
+                final Intent data = result.getData();
+                if (data != null
+                        && data.getBooleanExtra(FetchFromICloudActivity.RESULT_IMPORTED, false)) {
+                    this.importedFromAccount = true;
+                }
+                // The linked/unlinked subtitle is read when this screen is built, so without
+                // this it still says "not connected" underneath an account just connected.
+                this.sayWhetherTheAccountIsLinked();
+            }
+    );
+
+    /**
+     * Where "help build full support" goes.
+     *
+     * <p>Deliberately an issue rather than a wiki page. Someone reading this setting has just
+     * been told the app cannot do something Apple's app can, and the useful next step is the
+     * write-up of what implementing it would take - including the part that says the tokens
+     * needed are already in hand and unused.
+     */
+    private static final String APPLE_DEVICES_ISSUE_URL =
+            "https://github.com/parawanderer/OpenTagViewer/issues/131";
+
+    /** Reading whether the account is linked, so leaving does not land on dead views. */
+    private Disposable membershipLookup;
 
 
     @Override
@@ -125,17 +225,37 @@ public class SettingsActivity extends AppCompatActivity {
         this.themeChoices.add(this.getString(R.string.dark_theme));
 
         this.binding = DataBindingUtil.setContentView(this, R.layout.activity_settings);
-        WindowPaddingUtil.insertUITopPadding(binding.getRoot());
+        WindowPaddingUtil.insetForSystemBars(binding.getRoot());
+        // The bottom inset used to be applied to the scroll area here as well - the debug switch
+        // is the last row and the navigation bar sat on top of it. insetForSystemBars above now
+        // does that for the whole screen, as it does for every other one, so a second call would
+        // reserve the bar's height twice.
         this.binding.setHandleClickBack(this::handleEndActivity);
+        this.binding.setOnClickICloudLink(this::onClickICloudLink);
+        this.binding.setOnClickExtraSources(() ->
+                startActivity(new Intent(this, ExtraSourcesSettingsActivity.class)));
+
+        this.sayWhetherTheAccountIsLinked();
+
+        this.appUpdatesRow = new UpdateSettingsRow(this, this.binding::setAppUpdatesSubtitle);
+        this.binding.setOnClickAppUpdates(this.appUpdatesRow::onClick);
+        this.appUpdatesRow.refresh();
+
         this.binding.setOnClickTheme(this::onClickEditTheme);
         this.binding.setCurrentTheme(this.getCurrentThemeUiString());
         this.binding.setOnClickLanguage(this::onClickEditLanguage);
         this.binding.setCurrentLanguage(Optional.ofNullable(this.currentSettings.getLanguage()).map(this::getPrettyLanguageName).orElse(this.getString(R.string.use_system_default)));
         this.binding.setOnClickAnisetteServerUrl(this::onClickEditAnisetteServerUrl);
-        this.binding.setCurrentAnisetteServerUrl(this.currentSettings.getAnisetteServerUrl());
+        this.binding.setCurrentAnisetteServerUrl(this.getAnisetteProviderSummary());
         this.binding.setOnClickMapProvider(this::onClickEditMapProvider);
         this.binding.setCurrentMapProvider(this.getCurrentMapProviderUiString());
         this.binding.setIsDebugDataEnabled(Optional.ofNullable(this.currentSettings.getEnableDebugData()).orElse(false));
+        this.binding.setIsShowAppleDevicesEnabled(this.currentSettings.shouldShowAppleDevices());
+        this.binding.setIsScanInBackgroundEnabled(this.currentSettings.shouldScanInBackground());
+        this.binding.setOnClickAppleDevicesHelpLink(this::onClickAppleDevicesHelpLink);
+        this.binding.setIsSystemColorsSupported(DynamicColors.isDynamicColorAvailable());
+        this.binding.setIsSystemColorsEnabled(
+                this.currentSettings.getUseSystemColors() == Boolean.TRUE);
 
         if (this.getSupportActionBar() != null) {
             this.getSupportActionBar().hide();
@@ -143,6 +263,17 @@ public class SettingsActivity extends AppCompatActivity {
 
         MaterialSwitch switcher = this.findViewById(R.id.settings_app_debug_data_enabled);
         switcher.setOnCheckedChangeListener(this::onDebugDataEnabledChange);
+
+        MaterialSwitch appleDevices = this.findViewById(R.id.settings_show_apple_devices);
+        appleDevices.setOnCheckedChangeListener(this::onShowAppleDevicesChange);
+
+        MaterialSwitch backgroundScan = this.findViewById(R.id.settings_scan_in_background);
+        backgroundScan.setOnCheckedChangeListener(this::onScanInBackgroundChange);
+
+        MaterialSwitch systemColors = this.findViewById(R.id.settings_app_use_system_colors);
+        systemColors.setOnCheckedChangeListener(this::onUseSystemColorsChange);
+
+        this.setupLeftBehindSettings();
 
         this.setupUserInfo();
 
@@ -161,9 +292,13 @@ public class SettingsActivity extends AppCompatActivity {
     }
 
     private void handleEndActivity() {
-        if (this.mapProviderChanged) {
+        if (this.mapProviderChanged || this.shownDevicesChanged || this.importedFromAccount) {
             Intent data = new Intent();
-            data.putExtra("mapProviderChanged", true);
+            data.putExtra("mapProviderChanged", this.mapProviderChanged);
+            data.putExtra("shownDevicesChanged", this.shownDevicesChanged);
+            // Carried under the name the iCloud screen uses, so the map reads one key whether
+            // that screen was reached from the map, the device list, or through here.
+            data.putExtra(FetchFromICloudActivity.RESULT_IMPORTED, this.importedFromAccount);
             setResult(RESULT_OK, data);
         }
         this.finish();
@@ -172,6 +307,128 @@ public class SettingsActivity extends AppCompatActivity {
     @Override
     public void onBackPressed() {
         this.handleEndActivity();
+    }
+
+    /**
+     * Shows or hides the owner's own Apple devices, on every screen and in the fetch.
+     *
+     * <p>Flagged back to whoever launched this so the map rebuilds - it holds the tags in
+     * memory and reads that model for what to draw <i>and</i> what to search for, so a change
+     * here is not visible until it reloads. Same mechanism as the map provider, which has the
+     * same problem for the same reason.
+     */
+    private void onShowAppleDevicesChange(CompoundButton buttonView, boolean isChecked) {
+        if (this.currentSettings.shouldShowAppleDevices() == isChecked) {
+            return;
+        }
+
+        this.currentSettings.setShowAppleDevices(isChecked);
+        this.binding.setIsShowAppleDevicesEnabled(isChecked);
+        this.shownDevicesChanged = true;
+        this.saveSettings();
+
+        Log.i(TAG, "The owner's own Apple devices are now " + (isChecked ? "shown" : "hidden")
+                + "; they are " + (isChecked ? "also" : "no longer") + " searched for");
+    }
+
+    /**
+     * Starts or stops the background scan, and saves the choice.
+     *
+     * <p><b>Acted on immediately rather than at the next launch</b>, unlike its neighbour above.
+     * Somebody turning this on is asking for something to start happening, and somebody turning
+     * it off is asking for it to stop - most likely because they have just seen the notification
+     * and want it gone. Deferring either would read as the switch not working.
+     */
+    private void onScanInBackgroundChange(CompoundButton buttonView, boolean isChecked) {
+        if (this.currentSettings.shouldScanInBackground() == isChecked) {
+            return;
+        }
+
+        this.currentSettings.setScanInBackground(isChecked);
+        this.binding.setIsScanInBackgroundEnabled(isChecked);
+        this.saveSettings();
+
+        if (isChecked) {
+            this.askToShowTheNotification();
+            NearbyScanService.start(this);
+        } else {
+            NearbyScanService.stop(this);
+        }
+
+        Log.i(TAG, "Background scanning is now " + (isChecked ? "on" : "off"));
+    }
+
+    /**
+     * Asks for permission to show the service's notification, on the versions that require it.
+     *
+     * <p><b>The service runs either way, and that is the problem.</b> Android 13 made
+     * notifications a runtime permission, and a foreground service whose notification is
+     * suppressed still scans - so somebody who turned this on would get the battery cost and no
+     * sign that anything was happening, which is the one thing a permanent notification is for.
+     *
+     * <p>Asked at the moment it becomes relevant rather than at startup: a prompt at first
+     * launch, before anything wants to notify, is one people dismiss without reading. Nothing
+     * hangs on the answer - a refusal leaves the service running and invisible, which is the
+     * user's call to make.
+     */
+    private void askToShowTheNotification() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return;
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                == PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+
+        ActivityCompat.requestPermissions(
+                this, new String[] {Manifest.permission.POST_NOTIFICATIONS},
+                NOTIFICATION_PERMISSION_REQUEST_CODE);
+    }
+
+    /** Request code for {@link #askToShowTheNotification()}. Nothing depends on the answer. */
+    private static final int NOTIFICATION_PERMISSION_REQUEST_CODE = 2001;
+
+    /**
+     * Re-posts the service's notification once permission arrives.
+     *
+     * <p><b>Because the grant lands after the service has already started.</b> The dialog is
+     * asynchronous, so the service goes to the foreground while notifications are still denied,
+     * and the system drops the notification it posts. Nothing re-posts it afterwards, so the
+     * service scans invisibly for the rest of its life - permission granted, status bar empty,
+     * which is exactly the state this setting must not leave somebody in.
+     *
+     * <p>Starting an already-running service is cheap and safe: it re-enters
+     * {@code onStartCommand}, which posts the notification again and leaves the existing scan
+     * alone.
+     */
+    @Override
+    public void onRequestPermissionsResult(
+            final int requestCode, final String[] permissions, final int[] grantResults) {
+
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+
+        if (requestCode != NOTIFICATION_PERMISSION_REQUEST_CODE) {
+            return;
+        }
+
+        final boolean granted = grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+
+        if (granted && this.currentSettings.shouldScanInBackground()) {
+            Log.i(TAG, "Notification permission granted; re-posting the service notification");
+            NearbyScanService.start(this);
+        }
+    }
+
+    /**
+     * Opens the issue tracking real support for locating the owner's own devices.
+     *
+     * <p>A link in a settings screen rather than a paragraph, because the honest answer to "why
+     * is this off" is "nobody has built the other half yet", and the useful thing to do with
+     * that information is go and read what building it would involve.
+     */
+    private void onClickAppleDevicesHelpLink() {
+        WebLink.open(this, APPLE_DEVICES_ISSUE_URL);
     }
 
     private void onDebugDataEnabledChange(CompoundButton buttonView, boolean isChecked) {
@@ -183,6 +440,35 @@ public class SettingsActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * Turns wallpaper colouring on or off, and rebuilds the screen so the change is visible
+     * immediately.
+     *
+     * <p>A theme overlay is chosen when an activity is created, so this one has to be
+     * recreated to show the new palette. Everything behind it is recreated by Android when it
+     * returns to the foreground, having already been through {@code onStop}, so the stack
+     * ends up consistent without restarting the app.
+     *
+     * <p>The in-memory flag and the stored setting are both updated, so a recreate now and a
+     * cold start later agree.
+     */
+    private void onUseSystemColorsChange(CompoundButton buttonView, boolean isChecked) {
+        final boolean oldChoice = this.currentSettings.getUseSystemColors() == Boolean.TRUE;
+        if (oldChoice == isChecked) {
+            return;
+        }
+
+        this.currentSettings.setUseSystemColors(isChecked);
+        this.binding.setIsSystemColorsEnabled(isChecked);
+        this.saveSettings();
+
+        OpenAirTagApplication.setUseSystemColors(isChecked);
+
+        Log.i(TAG, "Updating system colours choice to " + isChecked);
+
+        this.recreate();
+    }
+
     private String getCurrentThemeUiString() {
         if (this.currentSettings.getUseDarkTheme() == null) {
             return this.getString(R.string.use_system_default);
@@ -190,6 +476,73 @@ public class SettingsActivity extends AppCompatActivity {
         return this.currentSettings.getUseDarkTheme()
                 ? this.getString(R.string.dark_theme)
                 : this.getString(R.string.light_theme);
+    }
+
+    /** What the membership lookup last said. Decides where the Apple iCloud link row goes. */
+    private boolean accountIsLinked = false;
+
+    /** Settings -> App updates. */
+    private UpdateSettingsRow appUpdatesRow;
+
+    /**
+     * Say whether this app has already joined the account's keychain.
+     *
+     * <p><b>The row read the same either way</b>, which was the wrong answer twice over:
+     * somebody who has linked could not tell that they had, and somebody who had not was told
+     * their tags would "update" when nothing had ever been read.
+     *
+     * <p>Set to the unlinked wording first and corrected when the store answers, rather than left
+     * blank: reading it is a decryption on a background thread, and a row that grows a subtitle a
+     * moment later is worse than one that starts by describing the more common case. Reading
+     * again and unlinking are on {@link ICloudLinkActivity}.
+     */
+    private void sayWhetherTheAccountIsLinked() {
+        this.accountIsLinked = false;
+        this.binding.setICloudLinkSubtitle(this.getString(R.string.icloud_link_subtitle_unlinked));
+
+        this.membershipLookup = this.memberships().get()
+                .firstOrError()
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(
+                        held -> {
+                            this.accountIsLinked = held.isPresent();
+                            this.binding.setICloudLinkSubtitle(this.getString(held.isPresent()
+                                    ? R.string.icloud_link_subtitle_linked
+                                    : R.string.icloud_link_subtitle_unlinked));
+                        },
+                        error -> Log.w(TAG, "Could not read whether the account is linked;"
+                                + " leaving the row describing the unlinked case", error));
+    }
+
+    private KeychainMembershipRepository memberships() {
+        return new KeychainMembershipRepository(
+                UserAuthDataStore.getInstance(this.getApplicationContext()),
+                new AppCryptographyUtil());
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (this.appUpdatesRow != null) {
+            this.appUpdatesRow.dispose();
+        }
+        // The lookup hops back to the main thread to set a subtitle. If the screen has gone by
+        // then that is a binding update on detached views, so it is stopped rather than left to
+        // land wherever it lands.
+        if (this.membershipLookup != null && !this.membershipLookup.isDisposed()) {
+            this.membershipLookup.dispose();
+        }
+        super.onDestroy();
+    }
+
+    /**
+     * Not linked yet: start linking, since there is nothing to manage. Linked: open the page for
+     * reading again and unlinking. Both for a result, because what comes back decides whether
+     * the map has to rebuild (see importedFromAccount); ICloudLinkActivity passes its own
+     * fetch's result back for exactly that.
+     */
+    private void onClickICloudLink() {
+        this.fetchFromICloudLauncher.launch(new Intent(this, this.accountIsLinked
+                ? ICloudLinkActivity.class : FetchFromICloudActivity.class));
     }
 
     private void onClickEditTheme() {
@@ -222,6 +575,8 @@ public class SettingsActivity extends AppCompatActivity {
             return this.getString(R.string.map_provider_google);
         } else if ("amap".equals(provider)) {
             return this.getString(R.string.map_provider_amap);
+        } else if ("osm".equals(provider)) {
+            return this.getString(R.string.map_provider_osm);
         }
         return this.getString(R.string.map_provider_google);
     }
@@ -230,13 +585,16 @@ public class SettingsActivity extends AppCompatActivity {
         List<String> providerChoices = new ArrayList<>();
         providerChoices.add(this.getString(R.string.map_provider_google));
         providerChoices.add(this.getString(R.string.map_provider_amap));
-        
+        providerChoices.add(this.getString(R.string.map_provider_osm));
+
         String currentProvider = this.currentSettings.getMapProvider();
         int currentOption = 0; // 默认Google Maps
         if ("amap".equals(currentProvider)) {
             currentOption = 1;
+        } else if ("osm".equals(currentProvider)) {
+            currentOption = 2;
         }
-        
+
         var builder = new MaterialAlertDialogBuilder(this)
                 .setTitle(R.string.map_provider)
                 .setPositiveButton(R.string.accept, (dialog, which) -> {
@@ -245,8 +603,21 @@ public class SettingsActivity extends AppCompatActivity {
                     int checkedItemPosition = ((AlertDialog) dialog).getListView().getCheckedItemPosition();
                     
                     if (checkedItemPosition != AdapterView.INVALID_POSITION) {
-                        String selectedProvider = checkedItemPosition == 0 ? "google" : "amap";
+                        String selectedProvider = checkedItemPosition == 0 ? "google"
+                                : checkedItemPosition == 1 ? "amap" : "osm";
                         Log.d(TAG, "Selected map provider: " + selectedProvider);
+
+                        // AMap ships with no key: they are issued per developer account and
+                        // bound to a package name and signing fingerprint, so each user
+                        // brings their own. Selecting it without one would leave a blank map
+                        // and no explanation, so gate the change on having a key and take
+                        // the user straight to entering one.
+                        if ("amap".equals(selectedProvider) && !this.currentSettings.hasAmapApiKey()) {
+                            Toast.makeText(this, R.string.amap_key_required, Toast.LENGTH_LONG).show();
+                            this.onClickEditAmapApiKey(selectedProvider);
+                            return;
+                        }
+
                         this.updateMapProvider(selectedProvider);
                     }
                 })
@@ -256,9 +627,39 @@ public class SettingsActivity extends AppCompatActivity {
         builder.show();
     }
     
+    /**
+     * Prompt for the user's own AMap API key.
+     *
+     * @param providerToApplyOnSuccess if non-null, the provider to switch to once a key has
+     *                                 been supplied. Lets the picker route the user here and
+     *                                 have their selection complete afterwards, rather than
+     *                                 silently dropping it.
+     */
+    private void onClickEditAmapApiKey(final String providerToApplyOnSuccess) {
+        AmapApiKeyDialog.show(this, this.currentSettings.getAmapApiKey(), enteredKey -> {
+            this.currentSettings.setAmapApiKey(enteredKey);
+            this.saveSettings();
+
+            if (enteredKey == null) {
+                // Without a key AMap cannot render anything, so fall back rather than
+                // leaving a provider selected that will only ever show a blank map.
+                Toast.makeText(this, R.string.amap_key_cleared, Toast.LENGTH_SHORT).show();
+                if ("amap".equals(this.currentSettings.getMapProvider())) {
+                    this.updateMapProvider("google");
+                }
+                return;
+            }
+
+            Toast.makeText(this, R.string.amap_key_saved, Toast.LENGTH_SHORT).show();
+            if (providerToApplyOnSuccess != null) {
+                this.updateMapProvider(providerToApplyOnSuccess);
+            }
+        });
+    }
+
     private void updateMapProvider(String provider) {
         final String currentProvider = this.currentSettings.getMapProvider();
-        this.mapProviderChanged = this.mapProviderChanged || !java.util.Objects.equals(currentProvider, provider);
+        this.mapProviderChanged = this.mapProviderChanged || !Objects.equals(currentProvider, provider);
         this.currentSettings.setMapProvider(provider);
         this.binding.setCurrentMapProvider(this.getCurrentMapProviderUiString());
         this.saveSettings();
@@ -316,21 +717,335 @@ public class SettingsActivity extends AppCompatActivity {
         builder.show();
     }
 
-    private void onClickEditAnisetteServerUrl() {
-        // FindMy 0.9.x embeds the anisette URL inside the saved account JSON and
-        // refuses to swap providers post-login. Block changes while a session
-        // exists; the user can sign out below to change provider.
-        var existingAuth = this.authRepository.getUserAuth().blockingFirst();
-        if (existingAuth.isPresent()) {
-            Toast.makeText(
-                    this,
-                    R.string.anisette_change_requires_logout,
-                    Toast.LENGTH_LONG
-            ).show();
+    /**
+     * The choice between producing sign-in data here and asking a server for it, plus whatever
+     * the local side currently has to say for itself.
+     *
+     * <p>Anyone reaching this screen is already signed in, so an unchosen mode means they have
+     * been carried over from a version that only had servers: they stay on theirs until they
+     * say otherwise, because moving a live session onto a different machine identity forces a
+     * re-login. That is what the warning in this dialog is about.
+     */
+    private void setupAnisetteModeControls(final View view) {
+        final AppAutoCompleteTextView modeDropdown =
+                view.findViewById(R.id.anisetteModeSelectDropdown);
+        if (modeDropdown == null) {
             return;
         }
 
+        modeDropdown.setSimpleItems(new String[] {
+                this.getString(R.string.anisette_mode_local),
+                this.getString(R.string.anisette_mode_remote)
+        });
+
+        final String current = this.currentSettings.resolveAnisetteMode(true);
+        SharedMainSettingsManager.applyAnisetteMode(view, current);
+        // Nothing has changed yet, so there is nothing to warn about yet.
+        SharedMainSettingsManager.applyChangeWarning(view, false);
+
+        modeDropdown.setOnItemClickListener((parent, v, position, id) -> {
+            final String selected = position == 1
+                    ? UserSettings.ANISETTE_REMOTE : UserSettings.ANISETTE_LOCAL;
+            modeDropdown.setText(parent.getItemAtPosition(position).toString(), false);
+            modeDropdown.clearFocus();
+            SharedMainSettingsManager.applyAnisetteMode(view, selected);
+            this.pendingAnisetteMode = selected;
+            // Warn about the re-sign-in only once they have actually picked something else,
+            // and take it back if they pick their original mode again.
+            SharedMainSettingsManager.applyChangeWarning(view, !selected.equals(current));
+        });
+
+        this.loadLocalAnisetteStatus(view);
+
+        final View learnMore = view.findViewById(R.id.anisetteLearnMoreButton);
+        if (learnMore != null) {
+            learnMore.setOnClickListener(v -> this.openConfiguredLink("anisetteWikiPage"));
+        }
+
+        // Both buttons serve whichever file is missing: CoreADI for the emulated Mac, or the
+        // Apple Music APK for the Android libraries. See applyLocalAnisetteStatus.
+        final View whereToGetApk = view.findViewById(R.id.anisetteWhereToGetApkButton);
+        if (whereToGetApk != null) {
+            whereToGetApk.setOnClickListener(v -> {
+                if (this.lastLocalAnisetteStatus.needsCoreAdi()) {
+                    this.copyCoreAdiLink();
+                } else {
+                    this.openConfiguredLink("anisetteApkWikiPage");
+                }
+            });
+        }
+
+        final View chooseApk = view.findViewById(R.id.anisetteChooseApkButton);
+        if (chooseApk != null) {
+            chooseApk.setOnClickListener(v -> {
+                // Held so the result can be applied to the dialog that is still on screen.
+                this.anisetteDialogView = view;
+                // Not the APK mime type: files downloaded from a browser or a file host
+                // routinely arrive as octet-stream or with no type at all, and filtering them
+                // out would hide the very file people were told to go and find.
+                if (this.lastLocalAnisetteStatus.needsCoreAdi()) {
+                    this.pickCoreAdiLauncher.launch(new String[] {"*/*"});
+                } else {
+                    this.pickAnisetteApkLauncher.launch(new String[] {"*/*"});
+                }
+            });
+        }
+
+        final View clearApk = view.findViewById(R.id.anisetteClearApkButton);
+        if (clearApk != null) {
+            clearApk.setOnClickListener(v -> this.forgetTheSuppliedApk(view));
+        }
+    }
+
+    /** The Anisette dialog currently on screen, so a file-picker result can update it. */
+    private View anisetteDialogView;
+
+    /** What local Anisette said last, which decides which file the dialog's buttons ask for. */
+    private AnisetteStatus lastLocalAnisetteStatus = AnisetteStatus.pending();
+
+    /** Picks the iTunes 12.8.3 disk image, or CoreADI itself. See AppleLoginActivity's twin. */
+    private final ActivityResultLauncher<String[]> pickCoreAdiLauncher =
+            registerForActivityResult(new ActivityResultContracts.OpenDocument(), uri -> {
+                if (uri != null) {
+                    this.importCoreAdi(uri);
+                }
+            });
+
+    /** Store a CoreADI chosen by hand, checked against the download's own pins, then re-check. */
+    private void importCoreAdi(final Uri chosen) {
+        final View view = this.anisetteDialogView;
+        if (view != null) {
+            SharedMainSettingsManager.applyApkRejection(view, null);
+            SharedMainSettingsManager.applyLocalAnisetteStatus(
+                    view, AnisetteStatus.checking(), "", this.currentSettings.hasOwnAnisetteApk());
+        }
+
+        var async = Observable.fromCallable(() -> {
+                    try (InputStream in = this.getContentResolver().openInputStream(chosen)) {
+                        if (in == null) {
+                            return Optional.of("the file could not be opened");
+                        }
+                        MacCoreAdiFetcher.importFrom(in, EmulatedMacAnisette.libraryFile(this));
+                        return Optional.<String>empty();
+                    } catch (final MacCoreAdiFetcher.FetchException e) {
+                        Log.w(TAG, "the chosen file is not CoreADI", e);
+                        return Optional.of(String.valueOf(e.getMessage()));
+                    }
+                })
+                .subscribeOn(Schedulers.io())
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(problem -> {
+                    if (view == null) {
+                        return;
+                    }
+                    problem.ifPresent(p -> SharedMainSettingsManager.applyApkRejection(view, p));
+                    this.loadLocalAnisetteStatus(view);
+                }, error -> Log.e(TAG, "failed to import the chosen CoreADI", error));
+    }
+
+    private void copyCoreAdiLink() {
+        final ClipboardManager clipboard =
+                (ClipboardManager) this.getSystemService(Context.CLIPBOARD_SERVICE);
+        if (clipboard != null) {
+            clipboard.setPrimaryClip(ClipData.newPlainText("iTunes 12.8.3",
+                    MacCoreAdiFetcher.DMG_URL));
+            Toast.makeText(this, R.string.exported_tags_code_copied, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /**
+     * Picks an Apple Music APK to take the ADI libraries from.
+     *
+     * <p>{@code OpenDocument} rather than {@code GetContent}: this reads a file of tens of
+     * megabytes, and a persistable grant means a copy that stays readable rather than one that
+     * evaporates the moment the dialog closes.
+     */
+    private final ActivityResultLauncher<String[]> pickAnisetteApkLauncher =
+            registerForActivityResult(new ActivityResultContracts.OpenDocument(), uri -> {
+                if (uri != null) {
+                    this.importAnisetteApk(uri);
+                }
+            });
+
+    /**
+     * Take the libraries out of a chosen APK, if they are the ones this app knows how to use.
+     *
+     * <p>Off the main thread: it reads and hashes tens of megabytes.
+     *
+     * <p>Nothing about accepting a file from elsewhere lowers the bar. It is checked against
+     * the same recorded hashes as Apple's own copy, so a wrong or hostile file is rejected by
+     * exactly the check that rejects a corrupted download - and nothing is kept unless every
+     * library matched.
+     */
+    private void importAnisetteApk(final Uri apk) {
+        final View view = this.anisetteDialogView;
+        if (view != null) {
+            SharedMainSettingsManager.applyApkRejection(view, null);
+            SharedMainSettingsManager.applyLocalAnisetteStatus(
+                    view, AnisetteStatus.checking(), "", this.currentSettings.hasOwnAnisetteApk());
+        }
+
+        var async = Observable.fromCallable(() -> {
+                    final String abi = Build.SUPPORTED_ABIS[0];
+                    final String problem = AdiLibraryImporter.importFrom(
+                            this, apk, LocalAnisette.libraryDirectory(this, abi), abi);
+                    return Optional.ofNullable(problem);
+                })
+                .subscribeOn(Schedulers.io())
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(problem -> {
+                    if (problem.isPresent()) {
+                        // The status has to be put back, not merely left. The spinner was
+                        // turned on for this import, and returning without restoring it left
+                        // the dialog saying "Checking..." for ever after a refused file.
+                        if (view != null) {
+                            SharedMainSettingsManager.applyApkRejection(view, problem.get());
+                            this.loadLocalAnisetteStatus(view);
+                        }
+                        return;
+                    }
+
+                    // Remembered only so the screen can offer to go back to Apple's copy. The
+                    // libraries themselves are already extracted and verified, so nothing
+                    // later has to read this file again - or still have permission to.
+                    this.currentSettings.setAnisetteApkUri(apk.toString());
+                    this.saveSettings();
+
+                    if (view != null) {
+                        this.loadLocalAnisetteStatus(view);
+                    }
+                }, error -> Log.e(TAG, "failed to import the supplied APK", error));
+    }
+
+    /**
+     * Go back to Apple's copy.
+     *
+     * <p>Deletes the extracted libraries as well as forgetting the file: leaving them would
+     * mean "use Apple's copy" quietly kept using the other one, since the fetcher skips the
+     * network for files that are already there.
+     */
+    private void forgetTheSuppliedApk(final View view) {
+        SharedMainSettingsManager.applyApkRejection(view, null);
+
+        var async = Observable.fromCallable(() -> {
+                    final String abi = Build.SUPPORTED_ABIS[0];
+                    final File directory = LocalAnisette.libraryDirectory(this, abi);
+                    for (final String name : LocalAnisette.requiredLibraries()) {
+                        final File library = new File(directory, name);
+                        if (library.exists() && !library.delete()) {
+                            Log.w(TAG, "could not remove " + library);
+                        }
+                    }
+                    return Boolean.TRUE;
+                })
+                .subscribeOn(Schedulers.io())
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(done -> {
+                    this.currentSettings.setAnisetteApkUri(null);
+                    this.saveSettings();
+                    this.loadLocalAnisetteStatus(view);
+                }, error -> Log.e(TAG, "failed to discard the supplied APK", error));
+    }
+
+    /**
+     * Find out how local Anisette is doing, and say so.
+     *
+     * <p>Off the main thread, because finding out means downloading Apple's libraries,
+     * hashing them and possibly provisioning with Apple. The dialog shows "sets itself up the
+     * next time you sign in" until an answer arrives, which is true while it is being worked
+     * out and stays true if nothing ever comes back.
+     *
+     * <p><b>This can do the setup rather than merely observe it.</b> There is no way to know
+     * whether something will work without trying it, and a status that said "unknown" would be
+     * worth nothing on the one screen built to answer the question. Opening these settings is
+     * a reasonable moment for it: somebody is looking at it, and the result explains itself.
+     *
+     * <p>Only attempted in local mode. Somebody using a server should not have 3 MB downloaded
+     * on their behalf for a status they are not reading.
+     */
+    private void loadLocalAnisetteStatus(final View view) {
+        if (!this.currentSettings.usesLocalAnisette(true)) {
+            SharedMainSettingsManager.applyLocalAnisetteStatus(
+                    view, AnisetteStatus.pending(), "",
+                    this.currentSettings.hasOwnAnisetteApk());
+            return;
+        }
+
+        // Spinner up front, because the answer can take a full connection timeout to arrive -
+        // the worst case being offline, which waits 30 seconds and then fails.
+        SharedMainSettingsManager.applyLocalAnisetteStatus(
+                view, AnisetteStatus.checking(), "", this.currentSettings.hasOwnAnisetteApk());
+
+        var async = Observable.fromCallable(() -> {
+                    final AnisetteSource source =
+                            AppDependencies.anisette(this, this.currentSettings, true);
+                    final AnisetteStatus status = AnisetteStatus.of(source);
+
+                    // Read here rather than on the main thread: it opens an asset.
+                    String version = "";
+                    try {
+                        version = AdiLibraryManifest.load(this).apkVersion();
+                    } catch (final Exception e) {
+                        Log.w(TAG, "could not read the ADI manifest for its version", e);
+                    }
+                    return Pair.create(status, version);
+                })
+                .subscribeOn(Schedulers.io())
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(
+                        result -> {
+                            this.lastLocalAnisetteStatus = result.first;
+                            SharedMainSettingsManager.applyLocalAnisetteStatus(
+                                    view, result.first, result.second,
+                                    this.currentSettings.hasOwnAnisetteApk());
+                        },
+                        error -> Log.w(TAG, "could not determine the local Anisette status",
+                                error));
+    }
+
+    /**
+     * What the Anisette row says underneath its title.
+     *
+     * <p>Never blank. It used to be the stored server URL, which is null for anybody who has
+     * only ever signed in with Anisette from their own device - they never visit the step that
+     * sets it - so the row sat there with a heading and nothing under it. Falling back to the
+     * mode's own name says something true in every case.
+     */
+    private String getAnisetteProviderSummary() {
+        // Anyone on this screen is signed in, so an unchosen mode means they came from a
+        // version that only had servers, and stay on theirs until they say otherwise.
+        if (this.currentSettings.usesLocalAnisette(true)) {
+            return this.getString(R.string.anisette_mode_local);
+        }
+
+        final String url = this.currentSettings.getAnisetteServerUrl();
+        return url == null || url.isBlank()
+                ? this.getString(R.string.anisette_mode_remote) : url;
+    }
+
+    /** Open one of the reference links in app.properties, or do nothing if it is not set. */
+    private void openConfiguredLink(final String property) {
+        final var properties = PropertiesUtil.getProperties(this.getAssets(), "app.properties");
+        if (properties == null) {
+            return;
+        }
+
+        final String url = properties.getProperty(property);
+        if (url == null || url.isBlank()) {
+            Log.w(TAG, "No " + property + " configured in app.properties");
+            return;
+        }
+
+        WebLink.open(this, url);
+    }
+
+    /** Set while the dialog is open; only meaningful until it is confirmed or dismissed. */
+    private String pendingAnisetteMode = null;
+
+    private void onClickEditAnisetteServerUrl() {
         View view = inflate(this, R.layout.anisette_server_url_input_dialog, null);
+
+        this.setupAnisetteModeControls(view);
 
         CircularProgressIndicatorSpec spec = new CircularProgressIndicatorSpec(view.getContext(), /* attrs= */ null, 0, com.google.android.material.R.style.Widget_Material3_CircularProgressIndicator_ExtraSmall);
         final IndeterminateDrawable<CircularProgressIndicatorSpec> progressIndicatorDrawable = IndeterminateDrawable.createCircularDrawable(view.getContext(), spec);
@@ -417,7 +1132,11 @@ public class SettingsActivity extends AppCompatActivity {
         });
 
         AlertDialog dialog = new MaterialAlertDialogBuilder(this)
-                .setTitle(R.string.anisette_server_url)
+                // Not "Anisette Server URL": this dialog chooses where sign-in data comes
+                // from, and in the usual case that is this device, with no server and no URL
+                // anywhere in it. The login screen keeps that wording, where it does label a
+                // URL field.
+                .setTitle(R.string.anisette_provider)
                 .setView(view)
                 .show();
 
@@ -425,15 +1144,35 @@ public class SettingsActivity extends AppCompatActivity {
     }
 
     private void handleAnisetteUrlChangeSave(final String validNewAnisetteUrl) {
+        final String originalMode = this.currentSettings.resolveAnisetteMode(true);
+        final boolean modeChanged = this.pendingAnisetteMode != null
+                && !this.pendingAnisetteMode.equals(originalMode);
+
+        if (this.pendingAnisetteMode != null) {
+            this.currentSettings.setAnisetteMode(this.pendingAnisetteMode);
+            // Choosing for themselves answers the question the upgrade prompt would ask, so
+            // it should not then go on to ask it.
+            this.currentSettings.setAnisetteUpgradeOffered(true);
+        }
+
         this.currentSettings.setAnisetteServerUrl(validNewAnisetteUrl);
-        this.binding.setCurrentAnisetteServerUrl(validNewAnisetteUrl);
+        this.binding.setCurrentAnisetteServerUrl(this.getAnisetteProviderSummary());
         this.saveSettings();
 
         var originalUrl = Optional.ofNullable(this.initialAnisetteUrl);
         var finalUrl = Optional.ofNullable(this.currentSettings.getAnisetteServerUrl());
 
-        if (!originalUrl.equals(finalUrl)) {
-            // we need to force a re-login, unfortunately
+        // Changing the mode binds the session to a different machine identity just as surely
+        // as changing the server does, so it takes the same path.
+        if (modeChanged || !originalUrl.equals(finalUrl)) {
+            // A re-login is genuinely required, not just a limitation of how the account
+            // is serialized. Anisette supplies a machine identity (X-Apple-I-MD-M and
+            // friends) derived from that server's own ADI provisioning, and Apple binds
+            // the session to it, so a session established via one server is not valid
+            // when presented with another server's identity. Rewriting the stored
+            // provider would keep the app running but leave it failing auth against
+            // Apple, which is worse than an honest re-login. The dialog warns about this
+            // up front (see anisette_url_change_warning).
             this.performLogout();
         }
     }
@@ -501,12 +1240,36 @@ public class SettingsActivity extends AppCompatActivity {
         LinearLayout loginDataContainer = this.findViewById(R.id.login_info_container);
         loginDataContainer.setVisibility(VISIBLE);
 
+        // Swap the loading skeleton for the real thing. Both are sized alike, so this does not
+        // move anything below it.
+        this.findViewById(R.id.login_details_placeholder).setVisibility(GONE);
+        this.findViewById(R.id.login_details).setVisibility(VISIBLE);
+
+        // **A stored session might not carry a name and email, and that must not be fatal.**
+        // This used to chain straight through getAccount().getInfo(), so a session that
+        // deserialised without an account block - an older format, a partial write, anything
+        // FindMy.py's shape has changed since - took the whole Settings screen down with a
+        // NullPointerException on open. Settings is also where the sign-out button lives, which
+        // makes it precisely the screen somebody with a broken session needs to reach.
+        //
+        // Missing details are left blank instead. The account row still renders, and the row
+        // that actually matters - Sign out - is still there and still works.
+        final UserAuthData.UserAccountInfo info = userAuthData.getAccount() == null
+                ? null : userAuthData.getAccount().getInfo();
+
+        if (info == null) {
+            Log.w(TAG, "The stored session carries no account details, so the name and email are"
+                    + " left blank. Signing out still works, which is the point of showing the"
+                    + " row at all.");
+        }
+
         TextView firstnameLastnameText = this.findViewById(R.id.firstame_lastname_settings_block);
-        final String userFirstNameLastName = userAuthData.getAccount().getInfo().getFirstName() + " " + userAuthData.getAccount().getInfo().getLastName();
+        final String userFirstNameLastName = info == null
+                ? "" : info.getFirstName() + " " + info.getLastName();
         firstnameLastnameText.setText(userFirstNameLastName);
 
         TextView emailText = this.findViewById(R.id.email_settings_block);
-        final String userEmail = userAuthData.getAccount().getInfo().getAccountName();
+        final String userEmail = info == null ? "" : info.getAccountName();
         emailText.setText(userEmail);
 
         Button logoutButton = this.findViewById(R.id.logout_button);
@@ -525,6 +1288,10 @@ public class SettingsActivity extends AppCompatActivity {
     }
 
     private void performLogout() {
+        // Let go of the Apple session too, closing its HTTP session and sockets rather
+        // than leaving them to a finaliser that cannot do it. See issue #133.
+        PythonAppleService.forget();
+
         var async = this.authRepository.clearUser()
                 .subscribe(() -> {
                     // logout by sending back to login page
@@ -592,5 +1359,107 @@ public class SettingsActivity extends AppCompatActivity {
                 this.performTestButton.setText(R.string.test);
             }
         }
+    }
+
+    /**
+     * Wires the two left-behind settings: how long to wait, and what it sounds like.
+     *
+     * <p>Both are written straight through on change rather than on leaving the screen. The
+     * service re-reads them on its own schedule, so a value that is only in memory here is one
+     * the thing that uses it never sees.
+     */
+    private void setupLeftBehindSettings() {
+        final Slider seconds = this.findViewById(R.id.settings_left_behind_seconds);
+        final TextView label = this.findViewById(R.id.settings_left_behind_seconds_label);
+
+        final int configured = this.currentSettings.resolveLeftBehindAfterSeconds();
+        seconds.setValue(configured);
+        label.setText(this.getString(R.string.left_behind_seconds_label, configured));
+
+        seconds.addOnChangeListener((slider, value, fromUser) -> {
+            final int chosen = Math.round(value);
+            label.setText(this.getString(R.string.left_behind_seconds_label, chosen));
+
+            if (!fromUser) {
+                return;
+            }
+
+            this.currentSettings.setLeftBehindAfterSeconds(chosen);
+            this.persistCurrentSettings("left-behind delay");
+        });
+
+        this.showChosenAlarmSound();
+        this.findViewById(R.id.settings_left_behind_sound_row)
+                .setOnClickListener(v -> this.pickAlarmSound());
+    }
+
+    /** Writes the current sound's own name under the row, so the setting says what it does. */
+    private void showChosenAlarmSound() {
+        final TextView value = this.findViewById(R.id.settings_left_behind_sound_value);
+        final String stored = this.currentSettings.getLeftBehindSoundUri();
+
+        if (stored == null || stored.isEmpty()) {
+            value.setText(R.string.left_behind_sound_default);
+            return;
+        }
+
+        // A sound can be deleted, or live on a volume that is not mounted, long after it was
+        // chosen. Naming it "default" then is honest: that is what will actually play.
+        final Ringtone ringtone = RingtoneManager.getRingtone(this, Uri.parse(stored));
+        final String title = ringtone == null ? null : ringtone.getTitle(this);
+
+        value.setText(title == null || title.isEmpty()
+                ? this.getString(R.string.left_behind_sound_default) : title);
+    }
+
+    /** Opens the system ringtone picker, starting from whatever is set now. */
+    private void pickAlarmSound() {
+        final String stored = this.currentSettings.getLeftBehindSoundUri();
+
+        final Intent picker = new Intent(RingtoneManager.ACTION_RINGTONE_PICKER)
+                .putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_ALARM)
+                .putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE,
+                        this.getString(R.string.left_behind_sound))
+                // Offering silence here would be a way to turn the alert off that leaves the
+                // switch reading as on, so the picker does not show it.
+                .putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, false)
+                .putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true)
+                .putExtra(RingtoneManager.EXTRA_RINGTONE_DEFAULT_URI,
+                        RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM))
+                .putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI,
+                        stored == null || stored.isEmpty() ? null : Uri.parse(stored));
+
+        this.alarmSoundPicker.launch(picker);
+    }
+
+    /**
+     * The chosen alarm sound coming back from the system picker.
+     *
+     * <p>A null URI is the "Default" entry rather than a cancelled pick - the picker is launched
+     * without a silent option - and is stored as empty, which is what the service reads as "the
+     * system default alarm".
+     */
+    private final ActivityResultLauncher<Intent> alarmSoundPicker =
+            registerForActivityResult(new ActivityResultContracts.StartActivityForResult(),
+                    result -> {
+                        if (result.getResultCode() != RESULT_OK || result.getData() == null) {
+                            return;
+                        }
+
+                        final Uri picked = result.getData().getParcelableExtra(
+                                RingtoneManager.EXTRA_RINGTONE_PICKED_URI);
+
+                        this.currentSettings.setLeftBehindSoundUri(
+                                picked == null ? "" : picked.toString());
+                        this.persistCurrentSettings("alarm sound");
+                        this.showChosenAlarmSound();
+                    });
+
+    /** Stores the settings object as it stands, logging rather than interrupting on failure. */
+    private void persistCurrentSettings(final String what) {
+        this.settingsRepository.storeUserSettings(this.currentSettings)
+                .subscribeOn(Schedulers.io())
+                .subscribe(() -> Log.i(TAG, "Stored the " + what),
+                        error -> Log.w(TAG, "Could not store the " + what, error));
     }
 }

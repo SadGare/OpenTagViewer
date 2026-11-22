@@ -19,9 +19,28 @@ public final class UserSettingsDataStore {
     public static final Preferences.Key<String> ANISETTE_SERVER_URL = PreferencesKeys.stringKey("anisette_server_url");
     public static final Preferences.Key<String> LANGUAGE = PreferencesKeys.stringKey("language");
     public static final Preferences.Key<Boolean> USE_DARK_THEME = PreferencesKeys.booleanKey("use_dark_theme");
+    public static final Preferences.Key<Boolean> USE_SYSTEM_COLORS = PreferencesKeys.booleanKey("use_system_colors");
 
     public static final Preferences.Key<Boolean> ENABLE_DEBUG_DATA = PreferencesKeys.booleanKey("enable_debug_data");
     public static final Preferences.Key<String> MAP_PROVIDER = PreferencesKeys.stringKey("map_provider");
+    public static final Preferences.Key<String> AMAP_API_KEY = PreferencesKeys.stringKey("amap_api_key");
+    public static final Preferences.Key<String> ANISETTE_MODE = PreferencesKeys.stringKey("anisette_mode");
+    public static final Preferences.Key<String> ANISETTE_APK_URI = PreferencesKeys.stringKey("anisette_apk_uri");
+    public static final Preferences.Key<Boolean> ANISETTE_UPGRADE_OFFERED = PreferencesKeys.booleanKey("anisette_upgrade_offered");
+    public static final Preferences.Key<Boolean> SHOW_APPLE_DEVICES = PreferencesKeys.booleanKey("show_apple_devices");
+    public static final Preferences.Key<Boolean> ICLOUD_OFFER_MADE = PreferencesKeys.booleanKey("icloud_offer_made");
+    public static final Preferences.Key<Boolean> SCAN_IN_BACKGROUND = PreferencesKeys.booleanKey("scan_in_background");
+
+    /** Seconds of silence before a tag counts as left behind. Absent means the default. */
+    public static final Preferences.Key<Integer> LEFT_BEHIND_AFTER_SECONDS =
+            PreferencesKeys.intKey("left_behind_after_seconds");
+
+    /**
+     * The sound the left-behind alarm plays, as a content URI string. Empty means the system's
+     * default alarm sound, which is also what an unreadable or since-deleted one falls back to.
+     */
+    public static final Preferences.Key<String> LEFT_BEHIND_SOUND_URI =
+            PreferencesKeys.stringKey("left_behind_sound_uri");
 
     public static RxDataStore<Preferences> getInstance(Context context) {
         if (PREFERENCES_DATA_STORE == null) {

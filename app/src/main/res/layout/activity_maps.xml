@@ -13,9 +13,13 @@
         android:id="@+id/map"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="@color/md_theme_background"
+        android:background="?android:attr/colorBackground"
         tools:context=".MapsActivity" />
 
+    <!-- clipChildren/clipToPadding are both off so the cards' 8dp elevation shadow can draw
+         outside the content box. MapsActivity pads the bottom of this view by the navigation
+         bar inset, and with the default clipToPadding="true" that padding would slice the
+         shadow off along a hard edge. -->
     <HorizontalScrollView
         android:id="@+id/tags_scrollable_area"
         android:layout_width="match_parent"
@@ -23,6 +27,8 @@
         android:layout_alignParentLeft="true"
         android:layout_alignParentRight="true"
         android:layout_alignParentBottom="true"
+        android:clipChildren="false"
+        android:clipToPadding="false"
         android:scrollbarAlwaysDrawHorizontalTrack="false"
         android:scrollbarAlwaysDrawVerticalTrack="false"
         android:scrollbars="none"
@@ -57,7 +63,7 @@
             android:layout_height="40dp"
             android:layout_weight="1"
             android:background="@drawable/ripple_background"
-            android:backgroundTint="@color/md_theme_background"
+            android:backgroundTint="?android:attr/colorBackground"
             android:clickable="true"
             android:cropToPadding="false"
             android:elevation="8dp"
@@ -68,6 +74,32 @@
 
     </LinearLayout>
 
+    <!-- Shown only once a fetch has been running long enough to look like a hang. A tag with
+         no key alignment record makes the first fetch search its entire history, which is
+         minutes of sequential requests with nothing to show for it on screen. Placed to the
+         left of the menu button so the two never overlap.
+
+         Only while some tag has neither a location nor a recent Bluetooth sighting: a tag
+         already on screen gains nothing from the wait. See LongFetchBannerState. -->
+    <include
+        android:id="@+id/long_fetch_banner"
+        layout="@layout/long_fetch_banner"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_alignParentLeft="true"
+        android:layout_alignParentTop="true"
+        android:layout_marginLeft="16dp"
+        android:layout_marginTop="45dp"
+        android:layout_toLeftOf="@id/more_dropdown_top_right"
+        android:visibility="gone"
+        tools:visibility="visible" />
+
+    <!-- Anchored above the tag cards. Note that MapsActivity must hide tags_scrollable_area
+         with INVISIBLE rather than GONE: RelativeLayout ignores layout_above when its anchor
+         is GONE, and with no other vertical rule these buttons would fall back to the top of
+         the screen, landing under the status bar. Adding layout_alignParentBottom as a
+         fallback does not work either - it is resolved after layout_above and wins, putting
+         the buttons behind the cards whenever tags are present. -->
     <LinearLayout
         android:id="@+id/buttons_bottom_right"
         android:layout_width="wrap_content"
@@ -90,7 +122,7 @@
             android:layout_height="40dp"
             android:layout_weight="1"
             android:background="@drawable/ripple_background"
-            android:backgroundTint="@color/md_theme_background"
+            android:backgroundTint="?android:attr/colorBackground"
             android:clickable="true"
             android:cropToPadding="false"
             android:elevation="8dp"
@@ -108,7 +140,7 @@
             android:layout_marginLeft="10dp"
             android:layout_weight="1"
             android:background="@drawable/ripple_background"
-            android:backgroundTint="@color/md_theme_background"
+            android:backgroundTint="?android:attr/colorBackground"
             android:clickable="true"
             android:cropToPadding="false"
             android:elevation="8dp"
@@ -120,5 +152,12 @@
             android:visibility="gone" />
 
     </LinearLayout>
+
+    <!--
+        Last child, so it is drawn over everything: with the session in this state nothing on
+        this screen can do its job, and a half-covered map invites tapping controls that will
+        silently fail. Hidden until a session actually needs a code.
+    -->
+    <include layout="@layout/two_factor_again_overlay" />
 
 </RelativeLayout>

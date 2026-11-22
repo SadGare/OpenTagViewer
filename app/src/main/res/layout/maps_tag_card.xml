@@ -7,16 +7,19 @@
 
     <FrameLayout
         android:layout_width="match_parent"
-        android:layout_height="wrap_content">
+        android:layout_height="match_parent">
 
+        <!-- match_parent so every card fills the uniform height MapsActivity forces on it;
+             with wrap_content the shorter cards would keep their own height and the white
+             panel would stop short of the card below it. -->
         <LinearLayout
             android:id="@+id/tag_item_container"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
+            android:layout_height="match_parent"
             android:layout_marginLeft="4dp"
             android:layout_marginRight="4dp"
             android:background="@drawable/layout_rounded"
-            android:backgroundTint="@color/md_theme_background"
+            android:backgroundTint="?android:attr/colorBackground"
             android:clipToPadding="false"
             android:elevation="8dp"
             android:orientation="vertical">
@@ -25,6 +28,7 @@
                 android:id="@+id/tag_item_top_text"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:layout_weight="1"
                 android:minHeight="96dp"
                 android:orientation="horizontal"
                 android:paddingLeft="15dp"
@@ -32,11 +36,16 @@
                 android:paddingRight="15dp"
                 android:paddingBottom="8dp">
 
+                <!-- layout_weight="1" here is load-bearing, not decoration. The sibling text
+                     column is match_parent, so this row always measures 102dp over budget; the
+                     1:1 weight split takes 51dp off each, leaving this column 51dp wide. Setting
+                     weight to 0 gives it the full 102dp and shoves the text column right by 51dp,
+                     narrowing it by the same amount. -->
                 <androidx.constraintlayout.widget.ConstraintLayout
                     android:layout_width="102dp"
                     android:layout_height="72dp"
-                    android:layout_gravity="top"
-                    android:layout_weight="0">
+                    android:layout_gravity="center"
+                    android:layout_weight="1">
 
                     <TextView
                         android:id="@+id/device_icon_emoji"
@@ -56,7 +65,7 @@
                         android:layout_weight="1"
                         android:padding="5dp"
                         android:src="@drawable/apple"
-                        android:tint="@color/md_theme_outline"
+                        android:tint="?attr/colorOutline"
                         android:visibility="visible"
                         app:layout_constraintBottom_toBottomOf="parent"
                         app:layout_constraintEnd_toEndOf="parent"
@@ -79,7 +88,7 @@
                         android:fontFamily="@font/nunito_bold"
                         android:maxLines="2"
                         android:text="SomeTag 1"
-                        android:textColor="@color/md_theme_onBackground"
+                        android:textColor="?attr/colorOnBackground"
                         android:textSize="18sp" />
 
                     <LinearLayout
@@ -98,7 +107,7 @@
                                 android:layout_width="19dp"
                                 android:layout_height="15dp"
                                 android:src="@drawable/marker_24_2"
-                                android:tint="@color/md_theme_onSurfaceVariant" />
+                                android:tint="?attr/colorOnSurfaceVariant" />
 
                         </androidx.constraintlayout.widget.ConstraintLayout>
 
@@ -111,28 +120,89 @@
                             android:gravity="center_vertical"
                             android:maxLines="3"
                             android:text="Streetstreet 1, 1234 CityThatIsLong Actually, Country"
-                            android:textColor="@color/md_theme_onSurfaceVariant"
+                            android:textColor="?attr/colorOnSurfaceVariant"
                             android:textSize="12sp" />
 
                     </LinearLayout>
 
-                    <TextView
-                        android:id="@+id/device_last_update"
+                    <LinearLayout
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:fontFamily="@font/nunito_semi_bold"
-                        android:text="@string/last_updated_x"
-                        android:textColor="@color/md_theme_outline"
-                        android:textSize="12sp" />
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical">
+
+                        <!--
+                            A live pulse for the map card only: lit briefly whenever this tag's
+                            own advertisement is actually heard, and dimmed again once
+                            NearbyStatusPulse.PULSE_WINDOW_MS has passed without another one -
+                            see MapsActivity#showNearbyStatusOn. GONE whenever the line below is
+                            the ordinary "last updated" one instead, since there is nothing live
+                            to show a pulse for then.
+                        -->
+                        <ImageView
+                            android:id="@+id/device_nearby_pulse"
+                            android:layout_width="8dp"
+                            android:layout_height="8dp"
+                            android:layout_marginEnd="4dp"
+                            android:contentDescription="@null"
+                            android:src="@drawable/circle_filled"
+                            android:visibility="gone"
+                            tools:visibility="visible" />
+
+                        <!--
+                            wrap_content rather than a weight, so the battery icon below follows
+                            the text instead of being pushed to the far end of the card.
+                        -->
+                        <TextView
+                            android:id="@+id/device_last_update"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:fontFamily="@font/nunito_semi_bold"
+                            android:text="@string/last_updated_x"
+                            android:textColor="?attr/colorOutline"
+                            android:textSize="12sp" />
+
+                        <!--
+                            The sighting's battery level, in place of the "· Battery medium" the
+                            line used to spell out - see NearbyBatteryIcon. Tinted the same
+                            colorOutline as the text beside it, with android:tint and not app:tint:
+                            only AppCompat's inflater reads the latter, so a plain LayoutInflater
+                            drew the vector's own colorControlNormal instead. GONE with the pulse, whenever the
+                            line is the ordinary "last updated" one, and for Google trackers,
+                            whose battery flags are encrypted.
+                        -->
+                        <ImageView
+                            android:id="@+id/device_nearby_battery"
+                            android:layout_width="16dp"
+                            android:layout_height="16dp"
+                            android:layout_marginStart="4dp"
+                            android:src="@drawable/battery_android_full_24px"
+                            android:tint="?attr/colorOutline"
+                            android:visibility="gone"
+                            tools:visibility="visible" />
+                    </LinearLayout>
                 </LinearLayout>
 
             </LinearLayout>
 
+            <!--
+                **`top`, not `center`.** Each of these four buttons is an icon circle above a
+                label, and the labels are not all one line: "Location History" wraps in English,
+                and which of them wrap changes with the language. Centring made the row as tall as
+                its tallest button and then centred the shorter ones inside it, so their circles
+                sat half a line lower than the wrapping one.
+
+                Aligning to the top puts every circle at the same y whatever the labels do.
+                Asserted by TagCardLayoutTest#everyButtonCircleSitsAtTheSameHeight - on the
+                circles, because the icons inside them are deliberately different sizes (28dp for
+                history, 20dp for refresh, 18dp for the other two) and so their own tops differ by
+                design.
+            -->
             <LinearLayout
                 android:id="@+id/tag_bottom_menu"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:gravity="center"
+                android:gravity="top|center_horizontal"
                 android:orientation="horizontal"
                 android:paddingTop="4dp"
                 android:paddingBottom="10dp">
@@ -144,7 +214,7 @@
                     android:layout_weight="1"
                     android:layout_marginLeft="8dp"
                     android:layout_marginRight="8dp"
-                    android:background="?attr/selectableItemBackground"
+                    android:background="@drawable/ripple_rounded_rect"
                     android:clickable="true"
                     android:gravity="top|center_horizontal"
                     android:onClick="onClickLocationHistory"
@@ -155,8 +225,8 @@
                         android:layout_width="40dp"
                         android:layout_height="40dp"
                         android:layout_gravity="center"
-                        android:background="@drawable/circle"
-                        android:backgroundTint="@color/md_theme_onBackground"
+                        android:background="@drawable/circle_filled"
+                        android:backgroundTint="?attr/colorSurfaceContainerHighest"
                         android:padding="8dp"
                         android:scaleType="fitCenter">
 
@@ -169,17 +239,17 @@
                             android:visibility="gone"
                             app:hideAnimationBehavior="inward"
                             app:showAnimationBehavior="inward"
-                            app:trackColor="@color/md_theme_surfaceVariant_highContrast"
+                            app:trackColor="?attr/colorSurfaceVariant"
                             app:trackCornerRadius="2dp" />
 
                         <ImageView
                             android:id="@+id/history_icon"
+                            android:tint="?attr/colorOnSurfaceVariant"
                             android:layout_width="28dp"
                             android:layout_height="28dp"
                             android:layout_gravity="center"
                             android:scaleType="fitCenter"
-                            android:src="@drawable/history_24px"
-                            android:tint="@color/md_theme_outline" />
+                            android:src="@drawable/history_24px" />
 
 
                     </FrameLayout>
@@ -203,7 +273,7 @@
                     android:layout_marginLeft="8dp"
                     android:layout_marginRight="8dp"
                     android:layout_weight="1"
-                    android:background="?attr/selectableItemBackground"
+                    android:background="@drawable/ripple_rounded_rect"
                     android:clickable="true"
                     android:gravity="top|center_horizontal"
                     android:onClick="onClickRefresh"
@@ -214,8 +284,8 @@
                         android:layout_width="40dp"
                         android:layout_height="40dp"
                         android:layout_gravity="center"
-                        android:background="@drawable/circle"
-                        android:backgroundTint="@color/md_theme_onBackground"
+                        android:background="@drawable/circle_filled"
+                        android:backgroundTint="?attr/colorSurfaceContainerHighest"
                         android:padding="8dp"
                         android:scaleType="fitCenter">
 
@@ -228,17 +298,17 @@
                             android:visibility="gone"
                             app:hideAnimationBehavior="inward"
                             app:showAnimationBehavior="inward"
-                            app:trackColor="@color/md_theme_surfaceVariant_highContrast"
+                            app:trackColor="?attr/colorSurfaceVariant"
                             app:trackCornerRadius="2dp" />
 
                         <ImageView
                             android:id="@+id/refresh_icon"
+                            android:tint="?attr/colorOnSurfaceVariant"
                             android:layout_width="20dp"
                             android:layout_height="20dp"
                             android:layout_gravity="center"
                             android:scaleType="fitCenter"
-                            android:src="@drawable/refresh_24"
-                            android:tint="@color/md_theme_outline" />
+                            android:src="@drawable/refresh_24" />
 
 
                     </FrameLayout>
@@ -258,21 +328,23 @@
                     android:id="@+id/device_ring_button_container"
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
+                    android:layout_marginLeft="8dp"
+                    android:layout_marginRight="8dp"
                     android:layout_weight="1"
-                    android:background="?attr/selectableItemBackground"
+                    android:background="@drawable/ripple_rounded_rect"
                     android:clickable="true"
                     android:gravity="top|center_horizontal"
                     android:onClick="onClickRing"
                     android:orientation="vertical"
                     android:padding="5dp"
-                    android:visibility="gone">
+                    android:visibility="visible">
 
                     <FrameLayout
                         android:layout_width="40dp"
                         android:layout_height="40dp"
                         android:layout_gravity="center"
-                        android:background="@drawable/circle"
-                        android:backgroundTint="@color/md_theme_onBackground"
+                        android:background="@drawable/circle_filled"
+                        android:backgroundTint="?attr/colorSurfaceContainerHighest"
                         android:padding="8dp"
                         android:scaleType="fitCenter">
 
@@ -285,17 +357,17 @@
                             android:visibility="gone"
                             app:hideAnimationBehavior="inward"
                             app:showAnimationBehavior="inward"
-                            app:trackColor="@color/md_theme_surfaceVariant_highContrast"
+                            app:trackColor="?attr/colorSurfaceVariant"
                             app:trackCornerRadius="2dp" />
 
                         <ImageView
                             android:id="@+id/perform_ring_icon"
+                            android:tint="?attr/colorOnSurfaceVariant"
                             android:layout_width="18dp"
                             android:layout_height="18dp"
                             android:layout_gravity="center"
                             android:scaleType="fitCenter"
-                            android:src="@drawable/volume_24"
-                            android:tint="@color/md_theme_outline" />
+                            android:src="@drawable/volume_24" />
 
 
                     </FrameLayout>
@@ -318,7 +390,7 @@
                     android:layout_marginLeft="8dp"
                     android:layout_marginRight="8dp"
                     android:layout_weight="1"
-                    android:background="?attr/selectableItemBackground"
+                    android:background="@drawable/ripple_rounded_rect"
                     android:clickable="true"
                     android:gravity="top|center_horizontal"
                     android:onClick="onClickMoreForDevice"
@@ -330,8 +402,8 @@
                         android:layout_width="40dp"
                         android:layout_height="40dp"
                         android:layout_gravity="center"
-                        android:background="@drawable/circle"
-                        android:backgroundTint="@color/md_theme_onBackground"
+                        android:background="@drawable/circle_filled"
+                        android:backgroundTint="?attr/colorSurfaceContainerHighest"
                         android:padding="8dp"
                         android:scaleType="fitCenter">
 
@@ -344,11 +416,12 @@
                             android:visibility="gone"
                             app:hideAnimationBehavior="inward"
                             app:showAnimationBehavior="inward"
-                            app:trackColor="@color/md_theme_surfaceVariant_highContrast"
+                            app:trackColor="?attr/colorSurfaceVariant"
                             app:trackCornerRadius="2dp" />
 
                         <ImageView
                             android:id="@+id/tag_more_icon"
+                            android:tint="?attr/colorOnSurfaceVariant"
                             android:layout_width="18dp"
                             android:layout_height="18dp"
                             android:layout_gravity="center"

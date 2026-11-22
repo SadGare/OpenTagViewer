@@ -1,17 +1,29 @@
-# This workflow will install Python dependencies, run tests and lint with a variety of Python versions
+# Lints and tests everything under python/: the desktop exporter and the shared export package.
 # For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
 
-name: MacOS Scripts
+# **"MacOS Scripts" was the old name and described none of this.** There are no scripts here, and
+# macOS is only where the runner happens to be - the local export route needs a Mac of 14 or older
+# to test, and everything else under python/ is platform-agnostic. The name is what shows on the
+# README badge, so it was telling every visitor that the exporter's tests were something else.
+#
+# The filename stays as it is: the badge URL is built from it, and renaming would break the badge
+# on every page that already links it, for a cosmetic gain.
+name: Exporter Tests
 
 on:
+  # This file is in its own filter, which it was not: a change to the workflow alone ran nothing,
+  # so a broken edit here was first exercised by whoever next touched python/ (AGENTS.md rule 16).
   push:
     branches: [ "main" ]
     paths:
       - "python/**"
+      - ".github/workflows/macos-scripts-python.yml"
   pull_request:
     branches: [ "main" ]
     paths:
       - "python/**"
+      - ".github/workflows/macos-scripts-python.yml"
+  workflow_dispatch:
 
 env:
   PYTHONPATH: "${{ github.workspace }}/python:$PYTHONPATH"
@@ -19,38 +31,74 @@ env:
 jobs:
   test:
 
-    runs-on: macos-14  # We *need* 14, this whole setup is only supported up to <= 14 (without weird security disabling hacks)
+    # **macOS 15, because GitHub no longer has 14.** `macos-14` stopped being offered in November
+    # 2026 ("The configuration 'macos-14-arm64-us-default' is not supported"), and with it every run
+    # of this workflow was cancelled before a step. It was there for two tests in
+    # test_airtag_decryptor.py, marked `skip_unless_macos_le14`: the macOS-local export route reads
+    # a key macOS 15 no longer hands out. Those two now skip here, and that is the coverage this
+    # gave up - they still run by hand on any Mac on 14 or older. Nothing else under python/ cares
+    # which macOS it is on.
+    runs-on: ${{ matrix.runner }}
 
     strategy:
       fail-fast: true
       matrix:
+        runner: [ macos-15 ]
+        # 3.9 used to be here, because it is what the Xcode Command Line Tools install and so what
+        # anyone running the wizard from source on a stock Mac gets. It is gone because FindMy.py
+        # requires 3.10, and the iCloud export route is the whole point of this exporter now.
+        #
+        # The consequence is real and belongs in the wiki rather than only here: running from
+        # source - the VM bootstrap - now needs a Python installed first. The built .app is
+        # unaffected; it bundles its own interpreter.
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        # **And Linux, where most people run the exporter**, which nothing tested before. One
+        # version is enough: what differs there is the platform, and the matrix above already
+        # covers the interpreters. Its Tk tests need a display, so it runs under Xvfb.
+        include:
+          - runner: ubuntu-latest
+            python-version: "3.13"
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
+      uses: actions/setup-python@v7
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+
+    # --frozen: install exactly what uv.lock records and fail if it disagrees with pyproject.toml,
+    # rather than quietly resolving something else. That is what makes the lock mean anything -
+    # FindMy.py is pinned there by commit, since it is a branch rather than a release.
     - name: Install dependencies
       working-directory: ./python
-      run: |
-        python -m pip install --upgrade pip
-        python -m pip install flake8 pytest
-        pip install -r requirements.txt
+      run: uv sync --frozen --python ${{ matrix.python-version }}
+
+    - name: Install a display for the Tk tests (Linux)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y xvfb
 
     - name: Lint with flake8
-      working-directory: . # run flake8 from repository root
+      working-directory: . # run flake8 from repository root, so it picks up .flake8
       run: |
-        # Run flake8 on the 'python' directory, letting it pick up the .flake8 config file
         # stop the build if there are Python syntax errors or undefined names
-        flake8 ./python --count --select=E9,F63,F7,F82 --show-source --statistics
-        flake8 ./python --count --exit-zero --statistics
+        uv run --project python flake8 ./python --count --select=E9,F63,F7,F82 --show-source --statistics
+        uv run --project python flake8 ./python --count --exit-zero --statistics
 
+    # Both suites: the wizard's own, and the shared export package's, which live with the package.
     - name: Test with pytest
       working-directory: ./python
+      # -rs, so the log says which tests skipped and why. xvfb-run only where there is no display.
+      run: ${{ runner.os == 'Linux' && 'xvfb-run -a ' || '' }}uv run --frozen pytest ./test ./opentagviewer_export -rs
+
+    # The release check reads VERSION out of main/version.py by parsing the module, so a refactor
+    # that makes it unreadable - moving it into a class, computing it from parts - would otherwise
+    # only surface when a release failed. This is that same read, run whenever python/ changes.
+    - name: Check the exporter version is still readable
+      working-directory: .
       run: |
-        pytest ./test
+        python scripts/release_version.py --kind exporter --print

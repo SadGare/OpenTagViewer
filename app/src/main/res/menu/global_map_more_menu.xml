@@ -5,6 +5,7 @@
         android:id="@+id/my_devices"
         android:title="@string/my_devices" />
 
+    <!-- One entry; what to import is chosen in ImportChooser, shared with My Devices -->
     <item
         android:id="@+id/do_import"
         android:title="@string/do_import" />
